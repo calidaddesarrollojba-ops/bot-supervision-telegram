@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Secrets / creds
+google_creds.json
+*.json
+
+# si quieres permitir group_links.json, comenta la linea de abajo
+group_links.json
+
+# Watermark temp
+wm_tmp/
