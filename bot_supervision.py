@@ -10,6 +10,7 @@
 #   $env:SHEET_TAB_SUPERVISORES="SUPERVISORES"
 #   $env:SHEET_TAB_TECNICOS_TUFIBRA="TECNICOS_TUFIBRA"
 #   $env:SHEET_TAB_CUADRILLAS_WIN="CUADRILLAS_WIN"
+#   $env:SHEET_TAB_DISTRITOS="DISTRITOS"
 #   $env:SHEET_TAB_ROUTING="ROUTING"
 #   $env:SHEET_TAB_PAIRING="PAIRING"
 #   $env:GOOGLE_CREDS_JSON_TEXT=(Get-Content google_creds.json -Raw)   # recomendado en Railway
@@ -31,10 +32,13 @@
 # 8) ✅ Admin-check basado en get_chat_member() comparando strings robustos (sin ChatMemberStatus)
 # 9) ✅ FIX BUG "WIN PASO 2.1": bandera expecting_codigo para que codigo_global NO capture búsquedas como código
 #
-# ✅ NUEVOS CAMBIOS (ESTABILIDAD):
-# A) Watermark DESACTIVADO por defecto para reducir 429 (ENABLE_WATERMARK_PHOTOS default=false)
-# B) Guardado en Sheets SIEMPRE se ejecuta aunque Telegram frene el envío (orden + try/except)
-# C) Envió a Telegram con reintentos ante RetryAfter (flood control) para evitar que reviente el handler
+# ✅ NUEVOS CAMBIOS (FUNCIONALIDAD):
+# C) Paso 5 ahora es "DISTRITO DE SUPERVISIÓN" (híbrido: búsqueda + botones desde sheet DISTRITOS)
+#    - Paso 6: Reporta ubicación
+#    - Paso 7: Evidencia de fachada
+# 1.1 Confirmación antes de finalizar (botones Sí/No antes de cerrar)
+# Estado final con botones: CORRECTA / OBSERVADA (se guarda en Supervisiones_v2 -> Estado_Final)
+# 6.1 Resumen diario automático (JobQueue): envía resumen diario a los destinos de RESUMEN por ROUTING
 
 import os
 import re
@@ -46,7 +50,7 @@ import asyncio
 import logging
 import secrets
 import string
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Dict, Any, List, Optional, Tuple
 
 import gspread
@@ -131,15 +135,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_TAB_PLANTILLAS = os.getenv("SHEET_TAB_PLANTILLAS", "Plantillas").strip()
 
-# ✅ Nuevo: Supervisiones_v2
+# ✅ Supervisiones_v2
 SHEET_TAB_SUPERVISIONES_V2 = os.getenv("SHEET_TAB_SUPERVISIONES_V2", "Supervisiones_v2").strip()
 
-# ✅ Nuevos: listas dinámicas
+# ✅ Listas dinámicas
 SHEET_TAB_SUPERVISORES = os.getenv("SHEET_TAB_SUPERVISORES", "SUPERVISORES").strip()
 SHEET_TAB_TECNICOS_TUFIBRA = os.getenv("SHEET_TAB_TECNICOS_TUFIBRA", "TECNICOS_TUFIBRA").strip()
 SHEET_TAB_CUADRILLAS_WIN = os.getenv("SHEET_TAB_CUADRILLAS_WIN", "CUADRILLAS_WIN").strip()
+SHEET_TAB_DISTRITOS = os.getenv("SHEET_TAB_DISTRITOS", "DISTRITOS").strip()
 
-# ✅ Nuevos: routing/pairing por sheets
+# ✅ Routing/pairing
 SHEET_TAB_ROUTING = os.getenv("SHEET_TAB_ROUTING", "ROUTING").strip()
 SHEET_TAB_PAIRING = os.getenv("SHEET_TAB_PAIRING", "PAIRING").strip()
 
@@ -148,10 +153,21 @@ SUP_CACHE_TTL_SEC = int(os.getenv("SUP_CACHE_TTL_SEC", "180"))              # 3 
 ROUTING_CACHE_TTL_SEC = int(os.getenv("ROUTING_CACHE_TTL_SEC", "180"))      # 3 min default
 PAIRING_TTL_MINUTES = int(os.getenv("PAIRING_TTL_MINUTES", "10"))           # 10 min default
 CUAD_CACHE_TTL_SEC = int(os.getenv("CUAD_CACHE_TTL_SEC", "180"))            # 3 min default (CUADRILLAS_WIN)
+DIST_CACHE_TTL_SEC = int(os.getenv("DIST_CACHE_TTL_SEC", "180"))            # 3 min default (DISTRITOS)
+
+# Resumen diario automático (hora Perú)
+DAILY_SUMMARY_ENABLED = os.getenv("DAILY_SUMMARY_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "20"))             # 20:00 por defecto
+DAILY_SUMMARY_MINUTE = int(os.getenv("DAILY_SUMMARY_MINUTE", "0"))
+DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY = os.getenv("DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY", "true").lower() in ("1", "true", "yes", "y")
 
 # WIN UX
-WIN_SUGGEST_MAX = int(os.getenv("WIN_SUGGEST_MAX", "6"))                    # máximo 6 sugerencias (definido)
+WIN_SUGGEST_MAX = int(os.getenv("WIN_SUGGEST_MAX", "6"))                    # máximo 6 sugerencias
 WIN_BUTTONS_MAX = 5                                                        # >5 => mostrar 5 + "Refinar búsqueda"
+
+# Distritos UX
+DIST_SUGGEST_MAX = int(os.getenv("DIST_SUGGEST_MAX", "8"))
+DIST_BUTTONS_MAX = 6
 
 # En Railway: NO subas google_creds.json al repo.
 # Usa GOOGLE_CREDS_JSON_TEXT (contenido JSON completo).
@@ -159,7 +175,7 @@ GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "google_creds.json").strip()
 GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 
 # ⚠️ Fallback temporal opcional para migración de ROUTING (si lo necesitas)
-# Formato esperado (ejemplo):
+# Formato esperado:
 # {"-100123":{"evidence":"-100999","summary":"-100888"}}
 ROUTING_JSON = os.getenv("ROUTING_JSON", "").strip()
 
@@ -168,7 +184,6 @@ MAX_MEDIA_PER_BUCKET = int(os.getenv("MAX_MEDIA_PER_BUCKET", "8"))
 # =========================
 # Watermark (DESACTIVADO por defecto para bajar 429)
 # =========================
-# Antes: default true. Ahora: default false.
 ENABLE_WATERMARK_PHOTOS = os.getenv("ENABLE_WATERMARK_PHOTOS", "false").lower() in ("1", "true", "yes", "y")
 WM_DIR = os.getenv("WM_DIR", "wm_tmp").strip()  # Railway recomendado: /tmp/wm_tmp
 WM_FONT_SIZE = int(os.getenv("WM_FONT_SIZE", "22"))
@@ -192,8 +207,11 @@ def now_peru_str() -> str:
     return now_peru_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 def iso_peru(dt: datetime) -> str:
-    # ISO-like, pero simple y legible
     return dt.astimezone(PERU_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def date_peru_ymd(dt: Optional[datetime] = None) -> str:
+    d = (dt or now_peru_dt()).astimezone(PERU_TZ)
+    return d.strftime("%Y-%m-%d")
 
 # =========================
 # Telegram: wrapper con reintentos (RetryAfter/429)
@@ -210,17 +228,14 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
         except RetryAfter as e:
             wait = float(getattr(e, "retry_after", 0) or 0)
             wait = max(wait, 1.0)
-            # pequeño jitter para evitar sincronía
             wait = wait + (TG_RETRY_JITTER_SEC * (0.5 + (attempt / (TG_MAX_RETRIES + 1))))
             logging.warning("⏳ RetryAfter en %s (intento %s/%s). Esperando %.1fs", what, attempt, TG_MAX_RETRIES, wait)
             await asyncio.sleep(wait)
             last_exc = e
             continue
         except TelegramError as e:
-            # Otros errores de Telegram (incluye 429 que no venga como RetryAfter en algún caso raro)
             logging.warning("⚠️ TelegramError en %s (intento %s/%s): %s", what, attempt, TG_MAX_RETRIES, e)
             last_exc = e
-            # backoff suave
             await asyncio.sleep(1.0 + attempt * 0.5)
             continue
         except Exception as e:
@@ -228,7 +243,6 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
             last_exc = e
             await asyncio.sleep(1.0 + attempt * 0.5)
             continue
-    # si se agotó, lanzar para que quien llame decida si ignora o aborta
     raise last_exc if last_exc else RuntimeError(f"{what}: fallo sin excepción?")
 
 # =========================
@@ -237,9 +251,10 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
 (
     S_SUPERVISOR,
     S_OPERADOR,
-    S_WIN_CUADRILLA,        # ✅ WIN: búsqueda/selección de cuadrilla
+    S_WIN_CUADRILLA,        # WIN: búsqueda/selección de cuadrilla
     S_CODIGO,
     S_TIPO,
+    S_DISTRITO,             # NUEVO: elegir distrito (búsqueda + botones)
     S_UBICACION,
     S_FACHADA_MEDIA,
     S_MENU_PRINCIPAL,
@@ -248,11 +263,13 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
     S_CARGA_MEDIA_BUCKET,
     S_ASK_OBS,
     S_WRITE_OBS,
+    S_CONFIRM_FINISH,       # NUEVO: confirmación antes de finalizar
     S_FINAL_TEXT,
+    S_ESTADO_FINAL,         # NUEVO: CORRECTA / OBSERVADA
     # /config flow
     S_CFG_MENU,
-    S_CFG_WAIT_CODE,        # destino pega código
-) = range(16)
+    S_CFG_WAIT_CODE,
+) = range(19)
 
 # =========================
 # MENUS / OPCIONES
@@ -346,9 +363,6 @@ def in_group(update: Update) -> bool:
 # =========================
 # Admin check (SIN ChatMemberStatus)
 # =========================
-# - Seguimos usando get_chat_member()
-# - Pero NO importamos ChatMemberStatus: comparamos strings robustos.
-# - En PTB, m.status típicamente es "creator", "administrator", "member", "restricted", "left", "kicked"
 _IS_ADMIN_LOGGED_ONCE = False
 
 def _status_str(m_status: Any) -> str:
@@ -359,8 +373,6 @@ def _status_str(m_status: Any) -> str:
 
 def _is_admin_status(m_status: Any) -> bool:
     s = _status_str(m_status)
-    # robustez extra: algunas libs imprimen "ChatMemberStatus.ADMINISTRATOR"
-    # entonces también evaluamos si contiene la palabra.
     if s in ("administrator", "creator"):
         return True
     if "administrator" in s or "creator" in s:
@@ -368,11 +380,6 @@ def _is_admin_status(m_status: Any) -> bool:
     return False
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Retorna True si el usuario es admin/creator del chat.
-    - Se basa en get_chat_member()
-    - Sin ChatMemberStatus (evita incompatibilidades de enums)
-    """
     global _IS_ADMIN_LOGGED_ONCE
 
     if not in_group(update):
@@ -391,7 +398,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
-    # quitar tildes básico (sin dependencias)
     repl = str.maketrans("áéíóúüñ", "aeiouun")
     s = s.translate(repl)
     return s
@@ -402,10 +408,6 @@ def _norm(s: str) -> str:
 _GS_CACHE: Dict[str, Any] = {"client": None, "headers": {}}
 
 def ensure_google_creds_file() -> None:
-    """
-    Compat: crea el archivo GOOGLE_CREDS_JSON (default google_creds.json)
-    usando el contenido de GOOGLE_CREDS_JSON_TEXT.
-    """
     if GOOGLE_CREDS_JSON_TEXT and not os.path.exists(GOOGLE_CREDS_JSON):
         try:
             d = os.path.dirname(GOOGLE_CREDS_JSON)
@@ -496,10 +498,6 @@ def gs_get_all_records(tab_name: str) -> List[Dict[str, Any]]:
     return out
 
 def gs_find_row_index_first(tab_name: str, criteria: Dict[str, str]) -> Optional[int]:
-    """
-    Busca la PRIMERA fila que coincida exactamente con criteria en columnas existentes.
-    Retorna índice 1-based o None.
-    """
     ws = gs_ws(tab_name)
     headers = gs_headers(tab_name)
     header_to_idx = {h: i for i, h in enumerate(headers)}  # 0-based
@@ -524,9 +522,6 @@ def gs_find_row_index_first(tab_name: str, criteria: Dict[str, str]) -> Optional
     return None
 
 def gs_update_row_by_headers(tab_name: str, row_index: int, patch: Dict[str, Any]) -> None:
-    """
-    Actualiza una fila existente por headers (solo columnas que existen).
-    """
     ws = gs_ws(tab_name)
     headers = gs_headers(tab_name)
     header_to_col = {h: i + 1 for i, h in enumerate(headers)}  # 1-based col
@@ -559,10 +554,6 @@ PLANTILLA_TEXT = (
 )
 
 def parse_plantilla(text: str) -> Dict[str, str]:
-    """
-    Extrae campos básicos. No falla si faltan.
-    En este bot, solo necesitamos Contrata, Distrito, Gestor + UUID (para ligar).
-    """
     def pick(label: str) -> str:
         m = re.search(rf"(?im)^{re.escape(label)}\s*:\s*(.+)$", text.strip(), re.MULTILINE)
         return (m.group(1).strip() if m else "")
@@ -581,10 +572,6 @@ async def cmd_plantilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_message(update, context, PLANTILLA_TEXT)
 
 async def auto_capture_plantilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Se ejecuta para mensajes de texto en grupos.
-    Si detecta "Código pedido:", intenta guardar en Google Sheet Plantillas.
-    """
     if not in_group(update):
         return
 
@@ -628,15 +615,6 @@ async def auto_capture_plantilla(update: Update, context: ContextTypes.DEFAULT_T
         await send_message(update, context, f"❌ No pude guardar la plantilla en Sheets.\nDetalle: {e}")
 
 async def cmd_cancelar_plantilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /cancelar_plantilla <CODIGO>
-    Borra la PRIMERA (más antigua) o la última según criterio. Aquí: borramos la última coincidencia
-    para:
-      - ChatID (grupo)
-      - UsuarioID (quien ejecuta)
-      - CódigoPedido (argumento)
-    Luego envía plantilla en blanco.
-    """
     if not in_group(update):
         await send_message(update, context, "Usa /cancelar_plantilla dentro del grupo.")
         return
@@ -656,7 +634,6 @@ async def cmd_cancelar_plantilla(update: Update, context: ContextTypes.DEFAULT_T
     user_id = str(update.effective_user.id if update.effective_user else "")
 
     try:
-        # buscamos la última coincidencia manualmente
         ws = gs_ws(SHEET_TAB_PLANTILLAS)
         headers = gs_headers(SHEET_TAB_PLANTILLAS)
         h2i = {h: i for i, h in enumerate(headers)}
@@ -696,6 +673,7 @@ async def cmd_reload_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _DYN_CACHE["supervisores"] = {"ts": 0.0, "items": []}
     _DYN_CACHE["tecnicos_tufibra"] = {"ts": 0.0, "items": []}
     _DYN_CACHE["cuadrillas_win"] = {"ts": 0.0, "items": []}
+    _DYN_CACHE["distritos"] = {"ts": 0.0, "items": []}
     _ROUTING_CACHE["ts"] = 0.0
     _ROUTING_CACHE["routes"] = {}
     await send_message(update, context, "✅ Cache recargado (Sheets headers + listas + routing).")
@@ -704,11 +682,6 @@ async def cmd_reload_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Buscar plantilla por CódigoPedido para /inicio
 # =========================
 def gs_fetch_last_plantilla_for_codigo(codigo: str) -> Optional[Dict[str, str]]:
-    """
-    Devuelve dict con:
-      Contrata, Distrito, Gestor, PlantillaUUID
-    buscando la última fila en Plantillas con CódigoPedido == codigo.
-    """
     ws = gs_ws(SHEET_TAB_PLANTILLAS)
     headers = gs_headers(SHEET_TAB_PLANTILLAS)
     header_to_idx = {h: i for i, h in enumerate(headers)}
@@ -749,24 +722,19 @@ def gs_fetch_last_plantilla_for_codigo(codigo: str) -> Optional[Dict[str, str]]:
     }
 
 # =========================
-# Dynamic Lists Cache (SUPERVISORES / TECNICOS_TUFIBRA / CUADRILLAS_WIN)
+# Dynamic Lists Cache
 # =========================
 _DYN_CACHE: Dict[str, Any] = {
     "supervisores": {"ts": 0.0, "items": []},
     "tecnicos_tufibra": {"ts": 0.0, "items": []},
     "cuadrillas_win": {"ts": 0.0, "items": []},
+    "distritos": {"ts": 0.0, "items": []},
 }
 
 def _is_truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "si", "sí", "on", "activo")
 
 def fetch_dyn_list(tab: str, cache_key: str, ttl_sec: int) -> List[Dict[str, Any]]:
-    """
-    Lee Sheet con columnas:
-      nombre, activo, orden, alias, updated_at
-    Retorna lista ordenada por 'orden' asc, luego 'nombre'.
-    Aplica cache TTL.
-    """
     now = time.time()
     c = _DYN_CACHE.get(cache_key, {"ts": 0.0, "items": []})
     if c["items"] and (now - float(c["ts"])) < ttl_sec:
@@ -796,7 +764,6 @@ def fetch_dyn_list(tab: str, cache_key: str, ttl_sec: int) -> List[Dict[str, Any
         items.sort(key=lambda x: (x.get("orden", 999999), _norm(x.get("nombre", ""))))
     except Exception as e:
         logging.warning(f"No se pudo cargar lista dinámica {tab}: {e}")
-        # Si falla lectura, mantenemos cache anterior (si existe)
         if c["items"]:
             return c["items"]
         return []
@@ -805,18 +772,6 @@ def fetch_dyn_list(tab: str, cache_key: str, ttl_sec: int) -> List[Dict[str, Any
     return items
 
 def fetch_cuadrillas_win(ttl_sec: int) -> List[Dict[str, Any]]:
-    """
-    Lee CUADRILLAS_WIN (6 columnas o las que existan), pero requiere al menos:
-      - nombre_completo (texto largo a guardar)
-    Opcionales:
-      - short_label (texto corto para botón)
-      - activo (true/1)
-      - orden (num)
-      - alias (opcional)
-      - updated_at (opcional)
-    Retorna items ordenados por 'orden' y luego nombre_completo.
-    Aplica cache TTL.
-    """
     now = time.time()
     c = _DYN_CACHE.get("cuadrillas_win", {"ts": 0.0, "items": []})
     if c["items"] and (now - float(c["ts"])) < ttl_sec:
@@ -826,7 +781,6 @@ def fetch_cuadrillas_win(ttl_sec: int) -> List[Dict[str, Any]]:
     try:
         records = gs_get_all_records(SHEET_TAB_CUADRILLAS_WIN)
         for r in records:
-            # Soportar nombres de columnas alternas por si el usuario las nombró distinto
             nombre_completo = str(
                 r.get("nombre_completo", "")
                 or r.get("Nombre_Completo", "")
@@ -855,26 +809,19 @@ def fetch_cuadrillas_win(ttl_sec: int) -> List[Dict[str, Any]]:
                 orden = 999999
 
             if not short_label:
-                # fallback: construir uno corto (ej. "P32 - ARUCUTIPA - OLMA SGI")
-                # intentamos detectar "P 32" y un apellido
                 nc = nombre_completo.strip()
                 tokens = re.split(r"\s+", nc)
                 pcode = ""
-                # buscar patrón P + número
                 m = re.search(r"(?i)\bP\s*[-_]*\s*(\d{1,4})\b", nc)
                 if m:
                     pcode = f"P{m.group(1)}"
-                # apellido probable: último token largo o el primer token de nombre propio al final
                 apellido = ""
-                # heurística: tomar el último token que tenga letras y longitud>=5
                 for t in reversed(tokens):
                     tt = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", "", t)
                     if len(tt) >= 5:
                         apellido = tt
                         break
-                # contrata: buscar "OLMA" o "SGI" etc (solo para label corto)
                 contr = ""
-                # tomar 2 tokens del medio si existen (heurística simple)
                 mid = []
                 for t in tokens:
                     if t.upper() in ("OLMA", "SGI", "WIN", "PUE", "LIMA"):
@@ -907,14 +854,70 @@ def fetch_cuadrillas_win(ttl_sec: int) -> List[Dict[str, Any]]:
     _DYN_CACHE["cuadrillas_win"] = {"ts": now, "items": items}
     return items
 
+def fetch_distritos(ttl_sec: int) -> List[Dict[str, Any]]:
+    """
+    Lee DISTRITOS con columnas:
+      - distrito (obligatorio)
+      - alias (opcional, separado por ;)
+      - zona (opcional)
+      - activo (1/0)
+      - orden (num)
+    """
+    now = time.time()
+    c = _DYN_CACHE.get("distritos", {"ts": 0.0, "items": []})
+    if c["items"] and (now - float(c["ts"])) < ttl_sec:
+        return c["items"]
+
+    items: List[Dict[str, Any]] = []
+    try:
+        records = gs_get_all_records(SHEET_TAB_DISTRITOS)
+        for r in records:
+            distrito = str(r.get("distrito", "") or r.get("Distrito", "") or r.get("DISTRITO", "")).strip()
+            if not distrito:
+                continue
+            activo = _is_truthy(r.get("activo", "1"))
+            if not activo:
+                continue
+            alias = str(r.get("alias", "")).strip()
+            zona = str(r.get("zona", "")).strip()
+            orden_raw = str(r.get("orden", "")).strip()
+            try:
+                orden = int(float(orden_raw)) if orden_raw != "" else 999999
+            except Exception:
+                orden = 999999
+
+            # Normalizados para match rápido
+            alias_tokens = []
+            if alias:
+                for a in alias.split(";"):
+                    aa = _norm(a)
+                    if aa:
+                        alias_tokens.append(aa)
+
+            items.append({
+                "distrito": distrito,
+                "alias": alias,
+                "zona": zona,
+                "orden": orden,
+                "norm": _norm(distrito),
+                "alias_norms": alias_tokens,
+            })
+
+        items.sort(key=lambda x: (x.get("orden", 999999), x.get("zona", ""), x.get("norm", "")))
+    except Exception as e:
+        logging.warning(f"No se pudo cargar DISTRITOS: {e}")
+        if c["items"]:
+            return c["items"]
+        return []
+
+    _DYN_CACHE["distritos"] = {"ts": now, "items": items}
+    return items
+
 def build_supervisor_menu() -> InlineKeyboardMarkup:
     items = fetch_dyn_list(SHEET_TAB_SUPERVISORES, "supervisores", SUP_CACHE_TTL_SEC)
     if not items:
-        # Fallback mínimo si la hoja no existe o está vacía
-        options = [("⚠️ SIN SUPERVISORES (revisar Sheet)", "SUP_NONE")]
-        return kb_inline(options, cols=1)
+        return kb_inline([("⚠️ SIN SUPERVISORES (revisar Sheet)", "SUP_NONE")], cols=1)
 
-    # Callback: SUP_PICK|<index>
     opts: List[Tuple[str, str]] = []
     for i, it in enumerate(items):
         label = it["alias"] if it.get("alias") else it["nombre"]
@@ -930,8 +933,7 @@ def pick_supervisor_by_index(i: int) -> Optional[str]:
 def build_tecnicos_tufibra_menu() -> InlineKeyboardMarkup:
     items = fetch_dyn_list(SHEET_TAB_TECNICOS_TUFIBRA, "tecnicos_tufibra", SUP_CACHE_TTL_SEC)
     if not items:
-        options = [("⚠️ SIN TÉCNICOS (revisar Sheet)", "TF_NONE")]
-        return kb_inline(options, cols=1)
+        return kb_inline([("⚠️ SIN TÉCNICOS (revisar Sheet)", "TF_NONE")], cols=1)
 
     opts: List[Tuple[str, str]] = []
     for i, it in enumerate(items):
@@ -949,7 +951,6 @@ def _tokenize_query(q: str) -> List[str]:
     qn = _norm(q)
     if not qn:
         return []
-    # separar por espacios y quitar tokens muy cortos (pero conservar números y "p32")
     raw = re.split(r"\s+", qn)
     toks = []
     for t in raw:
@@ -961,13 +962,6 @@ def _tokenize_query(q: str) -> List[str]:
     return toks
 
 def _score_match(nc_norm: str, query_norm: str, query_tokens: List[str]) -> int:
-    """
-    Score simple para ordenar resultados:
-      +200 si empieza por query
-      +120 si contiene query
-      +40 por token que aparece
-      +20 si coincide "p32" o patrón de P+numero
-    """
     score = 0
     if not nc_norm or not query_norm:
         return score
@@ -981,7 +975,6 @@ def _score_match(nc_norm: str, query_norm: str, query_tokens: List[str]) -> int:
         if t in nc_norm:
             score += 40
 
-    # bonus por Pxx
     m = re.search(r"\bp\s*(\d{1,4})\b", query_norm)
     if m:
         pn = f"p{m.group(1)}"
@@ -991,11 +984,6 @@ def _score_match(nc_norm: str, query_norm: str, query_tokens: List[str]) -> int:
     return score
 
 def win_find_matches(query: str) -> List[Dict[str, Any]]:
-    """
-    Devuelve matches (ordenados por score desc, luego orden asc)
-    Cada item:
-      {nombre_completo, short_label, score}
-    """
     items = fetch_cuadrillas_win(CUAD_CACHE_TTL_SEC)
     q = (query or "").strip()
     qn = _norm(q)
@@ -1009,12 +997,10 @@ def win_find_matches(query: str) -> List[Dict[str, Any]]:
         nc = it.get("nombre_completo", "")
         ncn = it.get("norm", _norm(nc))
 
-        # condición de match: substring o todos los tokens presentes
         ok = False
         if qn in ncn:
             ok = True
         else:
-            # todos los tokens deben aparecer
             if toks and all(t in ncn for t in toks):
                 ok = True
 
@@ -1033,16 +1019,11 @@ def win_find_matches(query: str) -> List[Dict[str, Any]]:
     return ranked
 
 def win_build_buttons(matches: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    """
-    - 2 a 5 coincidencias => botones para cada una
-    - >5 => 5 botones + "Refinar búsqueda"
-    """
     opts: List[Tuple[str, str]] = []
     take = min(len(matches), WIN_BUTTONS_MAX)
     for i in range(take):
         m = matches[i]
         label = (m.get("short_label") or m.get("nombre_completo") or "CUADRILLA").strip()
-        # limitar label del botón para evitar overflow visual
         if len(label) > 40:
             label = label[:37] + "..."
         opts.append((label, f"WIN_PICK|{i}"))
@@ -1050,6 +1031,92 @@ def win_build_buttons(matches: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     if len(matches) > WIN_BUTTONS_MAX:
         opts.append(("🔎 Refinar búsqueda", "WIN_REFINE"))
 
+    return kb_inline(opts, cols=1)
+
+def dist_find_matches(query: str) -> List[Dict[str, Any]]:
+    """
+    Match híbrido:
+    - exact/substring en distrito
+    - exact/substring en alias (cada token separado por ;)
+    - ranking por score + orden
+    """
+    items = fetch_distritos(DIST_CACHE_TTL_SEC)
+    q = (query or "").strip()
+    qn = _norm(q)
+    toks = _tokenize_query(q)
+
+    if not qn or len(qn) < 2:
+        return []
+
+    ranked: List[Dict[str, Any]] = []
+    for it in items:
+        dn = it.get("norm", "")
+        aliases = it.get("alias_norms", []) or []
+
+        ok = False
+        if qn in dn:
+            ok = True
+        else:
+            # alias contiene query
+            if any(qn in a for a in aliases):
+                ok = True
+            else:
+                # todos los tokens deben aparecer en distrito o alias
+                if toks:
+                    def token_ok(t: str) -> bool:
+                        if t in dn:
+                            return True
+                        return any(t in a for a in aliases)
+                    if all(token_ok(t) for t in toks):
+                        ok = True
+
+        if not ok:
+            continue
+
+        # scoring
+        score = 0
+        distrito = it.get("distrito", "")
+        if dn.startswith(qn):
+            score += 220
+        if qn in dn:
+            score += 140
+        if any(a.startswith(qn) for a in aliases):
+            score += 180
+        if any(qn in a for a in aliases):
+            score += 120
+        for t in toks:
+            if t in dn:
+                score += 35
+            if any(t in a for a in aliases):
+                score += 30
+
+        ranked.append({
+            "distrito": distrito,
+            "zona": it.get("zona", ""),
+            "orden": it.get("orden", 999999),
+            "score": score,
+        })
+
+    ranked.sort(key=lambda x: (-int(x.get("score", 0)), int(x.get("orden", 999999)), _norm(x.get("zona", "")), _norm(x.get("distrito", ""))))
+    return ranked
+
+def dist_build_buttons(matches: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    opts: List[Tuple[str, str]] = []
+    take = min(len(matches), DIST_BUTTONS_MAX)
+    for i in range(take):
+        m = matches[i]
+        label = (m.get("distrito") or "DISTRITO").strip()
+        zona = (m.get("zona") or "").strip()
+        if zona:
+            label = f"{label} ({zona})"
+        if len(label) > 50:
+            label = label[:47] + "..."
+        opts.append((label, f"DIST_PICK|{i}"))
+
+    if len(matches) > DIST_BUTTONS_MAX:
+        opts.append(("🔎 Refinar búsqueda", "DIST_REFINE"))
+
+    opts.append(("❌ Cancelar", "DIST_CANCEL"))
     return kb_inline(opts, cols=1)
 
 # =========================
@@ -1072,7 +1139,6 @@ def load_routing_cache(force: bool = False) -> Dict[str, Any]:
         return _ROUTING_CACHE["routes"]
 
     routes: Dict[str, Any] = {}
-    # 1) leer desde Sheets
     if _gs_ready():
         try:
             records = gs_get_all_records(SHEET_TAB_ROUTING)
@@ -1095,7 +1161,6 @@ def load_routing_cache(force: bool = False) -> Dict[str, Any]:
         except Exception as e:
             logging.warning(f"No se pudo leer ROUTING desde Sheets: {e}")
 
-    # 2) fallback opcional a ROUTING_JSON (migración)
     if ROUTING_JSON:
         try:
             j = json.loads(ROUTING_JSON)
@@ -1123,10 +1188,6 @@ def get_route_for_chat(origin_chat_id: int) -> Optional[Dict[str, Any]]:
     routes = load_routing_cache(force=False)
     return routes.get(str(origin_chat_id))
 
-def route_is_origin(origin_chat_id: int) -> bool:
-    r = get_route_for_chat(origin_chat_id)
-    return r is not None
-
 def route_dest_evidence(origin_chat_id: int) -> Optional[int]:
     r = get_route_for_chat(origin_chat_id)
     if not r or not r.get("activo"):
@@ -1152,7 +1213,6 @@ def pairing_expires_at_str(ttl_minutes: int) -> str:
 
 def parse_dt_peru(s: str) -> Optional[datetime]:
     try:
-        # asume formato "%Y-%m-%d %H:%M:%S"
         dt = datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S")
         return dt.replace(tzinfo=PERU_TZ)
     except Exception:
@@ -1172,6 +1232,7 @@ def sess(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         context.user_data["s"] = {
             "id_supervision": str(uuid.uuid4()),
             "estado": "",  # Completado / No Completado
+            "estado_final": "",  # CORRECTA / OBSERVADA
             "fecha_creacion": now_peru_str(),
             "fecha_cierre": "",
             "created_by": "",
@@ -1184,24 +1245,28 @@ def sess(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 
             "supervisor": None,
             "operador": None,
-            "tecnico": None,     # TU FIBRA: técnico; WIN: cuadrilla (nombre_completo)
+            "tecnico": None,
             "codigo": None,
             "tipo": None,
+
+            # NUEVO: distrito (PASO 5)
+            "distrito_supervision": "",
+            "dist_query_last": "",
+            "dist_matches": [],
+
             "location": None,    # (lat, lon)
             "final_text": "",
 
-            # ✅ FIX BUG: evita que codigo_global capture búsquedas de WIN como código
-            # True SOLO cuando el bot YA mostró "PASO 3 - INGRESA CÓDIGO..."
             "expecting_codigo": False,
 
             # WIN UX
             "win_query_last": "",
-            "win_matches": [],   # lista de matches calculados para botones (se guarda en sesión)
+            "win_matches": [],
 
-            # media items: {"type":"photo|video", "file_id": "...", "wm_file": "...optional local path"}
+            # media items
             "fachada": {"media": [], "obs": ""},
-            "cableado": {},   # bucket -> {media:[], obs:""}
-            "cuadrilla": {},  # bucket -> {media:[], obs:""}
+            "cableado": {},
+            "cuadrilla": {},
             "opcionales": {"media": [], "obs": ""},
             "current_section": None,
             "current_bucket": None,
@@ -1240,7 +1305,6 @@ def cleanup_wm_dir_if_empty() -> None:
         pass
 
 def cleanup_session_temp_files(s_: Dict[str, Any]) -> None:
-    """Borra archivos watermark temporales registrados en los items."""
     try:
         for section in ("fachada",):
             for item in s_.get(section, {}).get("media", []):
@@ -1310,10 +1374,6 @@ async def apply_watermark_photo_if_needed(
     lon: Optional[float],
     sent_dt_local: str
 ) -> Tuple[str, Optional[str]]:
-    """
-    Devuelve (file_id_original, path_local_watermarked_or_none)
-    - En fotos: descarga, coloca texto y guarda en WM_DIR para re-enviar como archivo local.
-    """
     if not ENABLE_WATERMARK_PHOTOS:
         return file_id, None
 
@@ -1362,10 +1422,6 @@ async def apply_watermark_photo_if_needed(
 # UX anti-spam: notify aggregated media count
 # =========================
 async def _media_notify_after_debounce(app: Application, chat_id: int, s_: Dict[str, Any], section: str, bucket: Optional[str]):
-    """
-    Envía/edita un solo mensaje con el total de archivos cargados en el bucket actual,
-    para evitar spam cuando se suben varias fotos al mismo tiempo.
-    """
     try:
         await asyncio.sleep(MEDIA_NOTIFY_DEBOUNCE_SEC)
 
@@ -1376,7 +1432,6 @@ async def _media_notify_after_debounce(app: Application, chat_id: int, s_: Dict[
         last_id = s_.get("media_notify_last_msg_id")
         last_text = s_.get("media_notify_last_text", "")
 
-        # Si el texto no cambió, no hacer nada
         if last_text == text and last_id:
             return
 
@@ -1394,7 +1449,6 @@ async def _media_notify_after_debounce(app: Application, chat_id: int, s_: Dict[
                 s_["media_notify_last_text"] = text
                 return
             except Exception:
-                # si no se puede editar (p.ej. mensaje viejo), cae a enviar nuevo
                 pass
 
         msg = await tg_call_with_retry(
@@ -1423,14 +1477,12 @@ async def inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_message(update, context, "Este bot se usa desde un grupo AUDITORIAS_... (no en privado).")
         return ConversationHandler.END
 
-    # Reset sesión
     context.user_data.pop("s", None)
     s_ = sess(context)
     s_["origin_chat_id"] = update.effective_chat.id
     s_["created_by"] = str(update.effective_user.id if update.effective_user else "")
-    s_["expecting_codigo"] = False  # ✅ FIX: al iniciar, NO esperar código
+    s_["expecting_codigo"] = False
 
-    # Pre-cargar route (si existe)
     r = get_route_for_chat(update.effective_chat.id)
     if r:
         s_["evidence_chat_id"] = _parse_int_chat_id(r.get("evidence_chat_id"))
@@ -1486,18 +1538,16 @@ async def on_pick_operador(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_["operador"] = op
 
     if op == "TU FIBRA":
-        # ✅ Elegir técnico desde sheet
         await safe_edit_or_send(
             query,
             "PASO 2.1 - ELIGE TÉCNICO (TU FIBRA)",
             reply_markup=build_tecnicos_tufibra_menu(),
         )
-        return S_OPERADOR  # se mantiene, manejamos TF_PICK en el mismo estado
+        return S_OPERADOR
     else:
-        # ✅ WIN: búsqueda en CUADRILLAS_WIN con sugerencias
         s_["win_query_last"] = ""
         s_["win_matches"] = []
-        s_["expecting_codigo"] = False  # ✅ FIX: aún NO estamos esperando código (evita codigo_global)
+        s_["expecting_codigo"] = False
         await safe_edit_or_send(
             query,
             "PASO 2.1 - BUSCAR CUADRILLA (WIN)\n\n"
@@ -1512,9 +1562,6 @@ async def on_pick_operador(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_WIN_CUADRILLA
 
 async def on_pick_tecnico_tufibra(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Este handler corre dentro del estado S_OPERADOR cuando operador=TU FIBRA.
-    """
     query = update.callback_query
     await query.answer()
     s_ = sess(context)
@@ -1535,7 +1582,7 @@ async def on_pick_tecnico_tufibra(update: Update, context: ContextTypes.DEFAULT_
         return S_OPERADOR
 
     s_["tecnico"] = tec
-    s_["expecting_codigo"] = True  # ✅ FIX: recién aquí el bot espera el código
+    s_["expecting_codigo"] = True
 
     await safe_edit_or_send(
         query,
@@ -1545,14 +1592,6 @@ async def on_pick_tecnico_tufibra(update: Update, context: ContextTypes.DEFAULT_
     return S_CODIGO
 
 async def on_win_cuadrilla_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    WIN UX:
-    - supervisor escribe texto
-    - buscamos en CUADRILLAS_WIN
-      * 1 match => autoselecciona y pasa a PASO 3
-      * 2 a 5 => botones
-      * >5 => 5 botones + "Refinar búsqueda"
-    """
     s_ = sess(context)
     if not update.message or not update.message.text:
         await send_message(update, context, "❌ Escribe parte del nombre/código para buscar la cuadrilla.")
@@ -1563,10 +1602,8 @@ async def on_win_cuadrilla_text(update: Update, context: ContextTypes.DEFAULT_TY
         await send_message(update, context, "❌ Texto muy corto. Escribe al menos 2 caracteres (ej: P32 / arucutipa).")
         return S_WIN_CUADRILLA
 
-    # ✅ FIX: durante búsqueda WIN, NO esperamos código (evita codigo_global)
     s_["expecting_codigo"] = False
 
-    # Intentar cargar CUADRILLAS_WIN (si falla, avisar claro)
     if not _gs_ready():
         await send_message(update, context, "⚠️ Sheets no está configurado (SHEET_ID/credenciales).")
         return S_WIN_CUADRILLA
@@ -1589,10 +1626,9 @@ async def on_win_cuadrilla_text(update: Update, context: ContextTypes.DEFAULT_TY
         return S_WIN_CUADRILLA
 
     if len(matches) == 1:
-        # Autoselecciona
         sel = matches[0]
         s_["tecnico"] = sel.get("nombre_completo", "")
-        s_["expecting_codigo"] = True  # ✅ FIX: recién aquí el bot espera el código
+        s_["expecting_codigo"] = True
         await send_message(
             update,
             context,
@@ -1602,9 +1638,7 @@ async def on_win_cuadrilla_text(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return S_CODIGO
 
-    # 2 a N => botones (según regla)
     kb = win_build_buttons(matches)
-    # Mensaje de contexto con conteo
     if len(matches) > WIN_BUTTONS_MAX:
         await send_message(
             update,
@@ -1623,11 +1657,6 @@ async def on_win_cuadrilla_text(update: Update, context: ContextTypes.DEFAULT_TY
     return S_WIN_CUADRILLA
 
 async def on_win_pick_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Selección por botón:
-    - botón muestra short_label
-    - guardamos nombre_completo completo en s_["tecnico"]
-    """
     query = update.callback_query
     await query.answer()
     s_ = sess(context)
@@ -1655,7 +1684,7 @@ async def on_win_pick_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_WIN_CUADRILLA
 
     s_["tecnico"] = full
-    s_["expecting_codigo"] = True  # ✅ FIX: recién aquí el bot espera el código
+    s_["expecting_codigo"] = True
 
     await safe_edit_or_send(
         query,
@@ -1671,7 +1700,7 @@ async def on_win_refine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     s_ = sess(context)
     s_["win_matches"] = []
-    s_["expecting_codigo"] = False  # ✅ FIX: refinar búsqueda NO es captura de código
+    s_["expecting_codigo"] = False
     await safe_edit_or_send(
         query,
         "🔎 Refinar búsqueda\n\n"
@@ -1692,7 +1721,6 @@ def looks_like_codigo(text: str) -> bool:
     return 3 <= len(t) <= 30 and re.match(r"^[A-Za-z0-9_-]+$", t) is not None
 
 async def codigo_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Rescate: si el ConversationHandler no toma el código, lo capturamos aquí."""
     if not in_group(update):
         return
     if not update.message or not update.message.text:
@@ -1702,13 +1730,11 @@ async def codigo_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s_:
         return
 
-    # Solo si hay sesión activa del mismo chat y todavía no hay código
     if s_.get("origin_chat_id") != update.effective_chat.id:
         return
     if s_.get("codigo"):
         return
 
-    # ✅ FIX: SOLO capturar si el bot realmente está esperando el código (PASO 3 ya mostrado)
     if not s_.get("expecting_codigo", False):
         return
 
@@ -1729,15 +1755,13 @@ async def on_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_CODIGO
 
     s_["codigo"] = codigo
-    s_["expecting_codigo"] = False  # ✅ FIX: ya capturamos el código, apagamos bandera
+    s_["expecting_codigo"] = False
 
-    # Buscar plantilla en Sheets (si está configurado)
     if _gs_ready():
         try:
             found = gs_fetch_last_plantilla_for_codigo(codigo)
             if found:
                 s_["plantilla_uuid"] = found.get("PlantillaUUID", "")
-                # ✅ Solo vincular: Contrata, Distrito, Gestor
                 s_["plantilla_contrata"] = found.get("Contrata", "")
                 s_["plantilla_distrito"] = found.get("Distrito", "")
                 s_["plantilla_gestor"] = found.get("Gestor", "")
@@ -1767,9 +1791,143 @@ async def on_pick_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return S_TIPO
 
+    # NUEVO PASO 5: DISTRITO
+    s_["dist_query_last"] = ""
+    s_["dist_matches"] = []
+
     await safe_edit_or_send(
         query,
-        "PASO 5 - REPORTA TU UBICACIÓN\n\n"
+        "PASO 5 - DISTRITO DE SUPERVISIÓN\n\n"
+        "✍️ Escribe el distrito (o abreviación).\n"
+        "Ejemplos:\n"
+        "• comas\n"
+        "• sjl\n"
+        "• vmt\n"
+        "• carmen de la legua\n\n"
+        f"🧠 El bot mostrará hasta {DIST_SUGGEST_MAX} sugerencias.",
+        reply_markup=None,
+    )
+    return S_DISTRITO
+
+async def on_distrito_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    if not update.message or not update.message.text:
+        await send_message(update, context, "❌ Escribe el distrito para buscar.")
+        return S_DISTRITO
+
+    q = update.message.text.strip()
+    if len(q) < 2:
+        await send_message(update, context, "❌ Texto muy corto. Escribe al menos 2 caracteres (ej: comas / sjl).")
+        return S_DISTRITO
+
+    if not _gs_ready():
+        await send_message(update, context, "⚠️ Sheets no está configurado (SHEET_ID/credenciales).")
+        return S_DISTRITO
+
+    matches = dist_find_matches(q)
+    s_["dist_query_last"] = q
+    s_["dist_matches"] = matches[:max(DIST_SUGGEST_MAX, 0)] if matches else []
+
+    if not matches:
+        await send_message(
+            update,
+            context,
+            "❌ No encontré coincidencias.\n\n"
+            "✅ Prueba así:\n"
+            "• Sin tildes (ej: brena)\n"
+            "• Abreviación (ej: sjl / smp / vmt)\n"
+            "• 2 palabras (ej: san miguel)\n\n"
+            "✍️ Escribe otra búsqueda:",
+        )
+        return S_DISTRITO
+
+    if len(matches) == 1:
+        sel = matches[0]
+        s_["distrito_supervision"] = sel.get("distrito", "")
+        await send_message(
+            update,
+            context,
+            "✅ Distrito seleccionado automáticamente:\n"
+            f"{s_.get('distrito_supervision','')}\n\n"
+            "PASO 6 - REPORTA TU UBICACIÓN\n\n"
+            "📌 En grupos, Telegram no permite solicitar ubicación con botón.\n"
+            "✅ Envía tu ubicación así:\n"
+            "1) Pulsa el clip 📎\n"
+            "2) Ubicación\n"
+            "3) Enviar ubicación actual",
+        )
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("📍 ENVIAR UBICACION (manual)")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await tg_call_with_retry(
+            lambda: context.application.bot.send_message(chat_id=update.effective_chat.id, text="👇", reply_markup=kb),
+            what="send_location_instructions",
+        )
+        return S_UBICACION
+
+    kb = dist_build_buttons(matches)
+    if len(matches) > DIST_BUTTONS_MAX:
+        await send_message(
+            update,
+            context,
+            f"Encontré {len(matches)} coincidencias.\n"
+            f"Mostrando {DIST_BUTTONS_MAX}. Pulsa una o refina tu búsqueda:",
+            reply_markup=kb,
+        )
+    else:
+        await send_message(update, context, f"Encontré {len(matches)} coincidencias. Elige una:", reply_markup=kb)
+
+    return S_DISTRITO
+
+async def on_distrito_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    s_ = sess(context)
+
+    data = query.data or ""
+    if data == "DIST_CANCEL":
+        await safe_edit_or_send(query, "❌ Proceso cancelado. Usa /inicio para empezar de nuevo.", reply_markup=None)
+        cleanup_session_temp_files(s_)
+        context.user_data.pop("s", None)
+        return ConversationHandler.END
+
+    if data == "DIST_REFINE":
+        s_["dist_matches"] = []
+        await safe_edit_or_send(
+            query,
+            "🔎 Refinar búsqueda (Distrito)\n\n"
+            "✍️ Escribe una búsqueda más específica.\n"
+            "Ejemplos:\n"
+            "• san juan\n"
+            "• sjl\n"
+            "• carmen legua\n"
+            "• la perla",
+            reply_markup=None,
+        )
+        return S_DISTRITO
+
+    m = re.match(r"^DIST_PICK\|(\d+)$", data)
+    if not m:
+        return S_DISTRITO
+
+    idx = int(m.group(1))
+    matches: List[Dict[str, Any]] = s_.get("dist_matches", []) or []
+    if not matches or idx < 0 or idx >= min(len(matches), DIST_BUTTONS_MAX):
+        await safe_edit_or_send(query, "⚠️ Selección inválida. Escribe de nuevo la búsqueda.", reply_markup=None)
+        s_["dist_matches"] = []
+        s_["dist_query_last"] = ""
+        return S_DISTRITO
+
+    sel = matches[idx]
+    s_["distrito_supervision"] = sel.get("distrito", "").strip()
+
+    await safe_edit_or_send(
+        query,
+        "✅ Distrito seleccionado:\n"
+        f"{s_.get('distrito_supervision','')}\n\n"
+        "PASO 6 - REPORTA TU UBICACIÓN\n\n"
         "📌 En grupos, Telegram no permite solicitar ubicación con botón.\n"
         "✅ Envía tu ubicación así:\n"
         "1) Pulsa el clip 📎\n"
@@ -1800,7 +1958,6 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_["current_section"] = "fachada"
     s_["current_bucket"] = None
 
-    # reset anti-spam notify per nueva sección
     _cancel_media_notify_task(s_)
     s_["media_notify_last_msg_id"] = None
     s_["media_notify_last_text"] = ""
@@ -1808,7 +1965,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_message(
         update,
         context,
-        f"PASO 6 - EVIDENCIA DE FACHADA\n📸🎥 Carga entre 1 a {MAX_MEDIA_PER_BUCKET} archivos (fotos o videos).",
+        f"PASO 7 - EVIDENCIA DE FACHADA\n📸🎥 Carga entre 1 a {MAX_MEDIA_PER_BUCKET} archivos (fotos o videos).",
         reply_markup=ReplyKeyboardRemove(),
     )
     return S_FACHADA_MEDIA
@@ -1841,7 +1998,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return S_CARGA_MEDIA_BUCKET if section != "fachada" else S_FACHADA_MEDIA
 
-    # Watermark solo para fotos (por defecto está desactivado)
     if item["type"] == "photo" and ENABLE_WATERMARK_PHOTOS:
         lat, lon = s_.get("location") if s_.get("location") else (None, None)
         sent_dt = now_peru_str()
@@ -1857,8 +2013,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     media_list.append(item)
 
-    # ✅ Anti-spam: no enviar un mensaje por cada foto.
-    # Programar (debounce) un mensaje único/edición con el total.
     _cancel_media_notify_task(s_)
     s_["media_notify_task"] = asyncio.create_task(
         _media_notify_after_debounce(
@@ -1890,13 +2044,12 @@ async def on_add_more_or_done(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_edit_or_send(query, "⚠️ Debes cargar al menos 1 archivo antes de completar.", reply_markup=None)
             return S_FACHADA_MEDIA if section == "fachada" else S_CARGA_MEDIA_BUCKET
 
-        # reset anti-spam notify al cambiar de estado
         _cancel_media_notify_task(s_)
         s_["media_notify_last_msg_id"] = None
         s_["media_notify_last_text"] = ""
 
         if section == "fachada":
-            await safe_edit_or_send(query, "PASO 7 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+            await safe_edit_or_send(query, "PASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
             return S_MENU_PRINCIPAL
 
         await safe_edit_or_send(
@@ -1926,7 +2079,7 @@ async def on_obs_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_or_send(query, "QUE EVIDENCIAS DESEAS CARGAR (CUADRILLA)", reply_markup=kb_inline(CUADRILLA_ITEMS, cols=2))
             return S_MENU_CUADRILLA
         if section == "opcionales":
-            await safe_edit_or_send(query, "PASO 7 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+            await safe_edit_or_send(query, "PASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
             return S_MENU_PRINCIPAL
 
     return S_MENU_PRINCIPAL
@@ -1951,7 +2104,7 @@ async def on_write_obs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_message(update, context, "✅ Observación guardada.\n\nQUE EVIDENCIAS DESEAS CARGAR (CUADRILLA)", reply_markup=kb_inline(CUADRILLA_ITEMS, cols=2))
         return S_MENU_CUADRILLA
     if section == "opcionales":
-        await send_message(update, context, "✅ Observación guardada.\n\nPASO 7 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        await send_message(update, context, "✅ Observación guardada.\n\nPASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
         return S_MENU_PRINCIPAL
 
     await send_message(update, context, "✅ Observación guardada.")
@@ -1965,7 +2118,6 @@ async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     s_ = sess(context)
 
-    # reset anti-spam notify al cambiar de sección/bucket
     _cancel_media_notify_task(s_)
     s_["media_notify_last_msg_id"] = None
     s_["media_notify_last_text"] = ""
@@ -1989,10 +2141,30 @@ async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_CARGA_MEDIA_BUCKET
 
     if query.data == "FINALIZAR":
+        # 1.1 Confirmación antes de finalizar
+        await safe_edit_or_send(
+            query,
+            "⚠️ Confirmación\n\n¿Deseas FINALIZAR la supervisión?\n\n"
+            "✅ Si finalizas, ya no podrás cargar más evidencias en esta supervisión.",
+            reply_markup=kb_inline([("✅ SÍ, FINALIZAR", "FIN_OK"), ("↩️ NO, SEGUIR", "FIN_NO")], cols=1),
+        )
+        return S_CONFIRM_FINISH
+
+    return S_MENU_PRINCIPAL
+
+async def on_confirm_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "FIN_NO":
+        await safe_edit_or_send(query, "✅ Continúa cargando evidencias.\n\nPASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        return S_MENU_PRINCIPAL
+
+    if query.data == "FIN_OK":
         await safe_edit_or_send(query, "INGRESAR OBSERVACIONES FINALES\n(Escribe el texto final)", reply_markup=None)
         return S_FINAL_TEXT
 
-    return S_MENU_PRINCIPAL
+    return S_CONFIRM_FINISH
 
 async def on_menu_cableado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2005,7 +2177,7 @@ async def on_menu_cableado(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
     if data == "FIN_CABLEADO":
-        await safe_edit_or_send(query, "PASO 7 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        await safe_edit_or_send(query, "PASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
         return S_MENU_PRINCIPAL
 
     s_["current_section"] = "cableado"
@@ -2026,7 +2198,7 @@ async def on_menu_cuadrilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data or ""
     if data == "FIN_CUADRILLA":
-        await safe_edit_or_send(query, "PASO 7 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        await safe_edit_or_send(query, "PASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
         return S_MENU_PRINCIPAL
 
     s_["current_section"] = "cuadrilla"
@@ -2037,7 +2209,7 @@ async def on_menu_cuadrilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_CARGA_MEDIA_BUCKET
 
 # =========================
-# Finalización: enviar a Evidencias/Resumen según ROUTING + guardar en Supervisiones_v2
+# Finalización: Estado final + guardar/enviar
 # =========================
 def build_summary(s_: Dict[str, Any]) -> str:
     lat, lon = s_["location"] if s_.get("location") else (None, None)
@@ -2048,7 +2220,7 @@ def build_summary(s_: Dict[str, Any]) -> str:
         extra = (
             "\n🧩 Datos de Plantilla:\n"
             f"• Contrata: {s_.get('plantilla_contrata','')}\n"
-            f"• Distrito: {s_.get('plantilla_distrito','')}\n"
+            f"• Distrito (Plantilla): {s_.get('plantilla_distrito','')}\n"
             f"• Gestor: {s_.get('plantilla_gestor','')}\n"
             f"• PlantillaUUID: {s_.get('plantilla_uuid','')}\n"
         )
@@ -2059,7 +2231,9 @@ def build_summary(s_: Dict[str, Any]) -> str:
         f"🏢 Operador: {s_.get('operador','')}\n"
         f"🧑‍🔧 Técnico/Cuadrilla: {s_.get('tecnico','')}\n"
         f"🧾 Código de pedido: {s_.get('codigo','')}\n"
-        f"🔥 Tipo de supervisión: {s_.get('tipo','')}\n\n"
+        f"🔥 Tipo de supervisión: {s_.get('tipo','')}\n"
+        f"🏙️ Distrito (Supervisión): {s_.get('distrito_supervision','')}\n"
+        f"✅ Estado final: {s_.get('estado_final','')}\n\n"
         f"📍 Ubicación:\n{maps_direct}\n"
         f"{extra}\n"
         "📝 Observaciones finales:\n"
@@ -2072,13 +2246,6 @@ def to_input_media(item: Dict[str, str]):
     return InputMediaVideo(item["file_id"])
 
 async def send_media_section(app: Application, chat_id: int, title: str, media_items: List[Dict[str, str]]):
-    """
-    Envío robusto:
-    - Mensaje título
-    - Envío por grupos de 10 (media_group)
-    - Si hay wm_file (cuando watermark habilitado), se envía por send_photo individual
-    - TODO con retry (RetryAfter)
-    """
     if not media_items:
         return
 
@@ -2087,13 +2254,11 @@ async def send_media_section(app: Application, chat_id: int, title: str, media_i
     batch: List[Dict[str, str]] = []
     for it in media_items:
         if it.get("type") == "photo" and it.get("wm_file") and os.path.exists(it["wm_file"]):
-            # flush batch primero
             if batch:
                 for chunk in chunk_list(batch, 10):
                     media = [to_input_media(x) for x in chunk]
                     await tg_call_with_retry(lambda m=media: app.bot.send_media_group(chat_id=chat_id, media=m), what="send_media_group_flush")
                 batch = []
-            # enviar foto watermark individual
             with open(it["wm_file"], "rb") as f:
                 await tg_call_with_retry(lambda fh=f: app.bot.send_photo(chat_id=chat_id, photo=fh), what="send_photo_wm")
         else:
@@ -2105,7 +2270,6 @@ async def send_media_section(app: Application, chat_id: int, title: str, media_i
             await tg_call_with_retry(lambda m=media: app.bot.send_media_group(chat_id=chat_id, media=m), what="send_media_group")
 
 def map_obs_columns_v2() -> Dict[Tuple[str, str], str]:
-    # ✅ Nombres compactos recomendados para Supervisiones_v2
     return {
         ("cableado", "CTO"): "Obs_CTO",
         ("cableado", "POSTE"): "Obs_POSTE",
@@ -2132,14 +2296,9 @@ def map_obs_columns_v2() -> Dict[Tuple[str, str], str]:
 def maps_link_from_latlon(lat: Optional[float], lon: Optional[float]) -> str:
     if lat is None or lon is None:
         return ""
-    # Link directo y estable:
     return f"https://maps.google.com/?q={lat},{lon}"
 
 def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelacion: str = "") -> Dict[str, Any]:
-    """
-    Construye payload para Supervisiones_v2.
-    Se escribe por headers: lo que no exista en la hoja se ignora.
-    """
     lat, lon = s_["location"] if s_.get("location") else (None, None)
     origin_chat_id = s_.get("origin_chat_id")
     ev_chat_id = s_.get("evidence_chat_id")
@@ -2148,6 +2307,7 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
     row: Dict[str, Any] = {}
     row["ID_Supervision"] = s_.get("id_supervision", "")
     row["ESTADO"] = estado
+    row["Estado_Final"] = s_.get("estado_final", "")  # NUEVO
     row["Fecha_Creacion"] = s_.get("fecha_creacion", "")
     row["Fecha_Cierre"] = s_.get("fecha_cierre", now_peru_str())
 
@@ -2158,14 +2318,15 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
     row["Gestor"] = s_.get("plantilla_gestor", "")
     row["Código_Pedido"] = s_.get("codigo", "")
     row["Tipo_Supervision"] = s_.get("tipo", "")
-    row["Distrito"] = s_.get("plantilla_distrito", "")
 
-    # Ubicación estructurada
+    # Distrito (nuevo flujo) + mantener distrito de plantilla en otra columna si existe
+    row["Distrito"] = s_.get("distrito_supervision", "") or s_.get("plantilla_distrito", "")
+    row["Distrito_Plantilla"] = s_.get("plantilla_distrito", "")
+
     row["Latitud"] = f"{lat:.15f}" if isinstance(lat, (int, float)) else ""
     row["Longitud"] = f"{lon:.15f}" if isinstance(lon, (int, float)) else ""
     row["Link_Ubicacion"] = maps_link_from_latlon(lat, lon)
 
-    # Observaciones por bucket
     m = map_obs_columns_v2()
     for bucket, data in s_.get("cableado", {}).items():
         col = m.get(("cableado", bucket))
@@ -2177,17 +2338,14 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
         if col:
             row[col] = data.get("obs", "")
 
-    # Opcionales / final
     row["Obs_ADICIONALES"] = s_.get("opcionales", {}).get("obs", "")
     row["Obs_FINALES"] = s_.get("final_text", "")
 
-    # Trazabilidad
     row["PlantillaUUID"] = s_.get("plantilla_uuid", "")
     row["Origin_Chat_ID"] = str(origin_chat_id) if origin_chat_id is not None else ""
     row["Evidence_Chat_ID"] = str(ev_chat_id) if ev_chat_id is not None else ""
     row["Summary_Chat_ID"] = str(su_chat_id) if su_chat_id is not None else ""
 
-    # Auditoría
     row["Creado_Por"] = s_.get("created_by", "")
     row["Cancelado_Por"] = s_.get("cancelado_por", "")
     row["Motivo_Cancelacion"] = motivo_cancelacion
@@ -2199,14 +2357,34 @@ async def on_final_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_ = sess(context)
     s_["final_text"] = (update.message.text or "").strip()
 
+    # NUEVO: pedir Estado final (botones)
+    await send_message(
+        update,
+        context,
+        "INDICAR ESTADO FINAL DE LA SUPERVISIÓN",
+        reply_markup=kb_inline([("✅ CORRECTA", "EF_CORRECTA"), ("⚠️ OBSERVADA", "EF_OBSERVADA")], cols=1),
+    )
+    return S_ESTADO_FINAL
+
+async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    s_ = sess(context)
+
+    if query.data == "EF_CORRECTA":
+        s_["estado_final"] = "CORRECTA"
+    elif query.data == "EF_OBSERVADA":
+        s_["estado_final"] = "OBSERVADA"
+    else:
+        return S_ESTADO_FINAL
+
     origin_chat_id = s_.get("origin_chat_id")
     if origin_chat_id is None:
-        await send_message(update, context, "❌ No se detectó el grupo de origen. Inicia con /inicio en el grupo AUDITORIAS.")
+        await safe_edit_or_send(query, "❌ No se detectó el grupo de origen. Inicia con /inicio en el grupo AUDITORIAS.", reply_markup=None)
         cleanup_session_temp_files(s_)
         context.user_data.pop("s", None)
         return ConversationHandler.END
 
-    # Resolución de rutas desde cache (routing)
     r = get_route_for_chat(origin_chat_id)
     if r:
         s_["evidence_chat_id"] = _parse_int_chat_id(r.get("evidence_chat_id"))
@@ -2216,25 +2394,20 @@ async def on_final_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dest_summary_id = s_.get("summary_chat_id")
 
     if not dest_evidencias_id and not dest_summary_id:
-        await send_message(
-            update,
-            context,
+        await safe_edit_or_send(
+            query,
             "⚠️ Este grupo aún no tiene rutas activas (ROUTING).\n"
             "Usa /config (admin) para vincular Evidencias/Resumen por código.\n"
             "También puedes ver rutas con /config → 📌 Ver rutas de este grupo.",
+            reply_markup=None,
         )
         cleanup_session_temp_files(s_)
         context.user_data.pop("s", None)
         return ConversationHandler.END
 
-    # Marcar cierre
     s_["fecha_cierre"] = now_peru_str()
     s_["estado"] = "Completado"
 
-    # =========================================================
-    # ✅ CAMBIO CLAVE: GUARDAR EN SHEETS PRIMERO (ANTI-PÉRDIDA DE DATA)
-    # - Si Telegram se frena con 429/RetryAfter, igual queda registrado.
-    # =========================================================
     sheets_ok = False
     if _gs_ready():
         try:
@@ -2245,33 +2418,24 @@ async def on_final_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheets_ok = True
         except Exception as e:
             logging.exception("❌ Error guardando supervisión v2 en Sheets")
-            # OJO: no abortamos; seguimos con Telegram.
             try:
-                await send_message(update, context, f"⚠️ No pude guardar en Sheets.\nDetalle: {e}")
+                await tg_call_with_retry(lambda: context.application.bot.send_message(chat_id=origin_chat_id, text=f"⚠️ No pude guardar en Sheets.\nDetalle: {e}"), what="warn_sheet_save")
             except Exception:
                 pass
 
     summary = build_summary(s_)
 
-    # =========================================================
-    # ✅ CAMBIO CLAVE: ENVÍO TELEGRAM ROBUSTO
-    # - Todo dentro de try/except para que NUNCA reviente el handler.
-    # - Con retry ante RetryAfter.
-    # =========================================================
     telegram_send_errors: List[str] = []
 
-    # Enviar resumen
     try:
         if dest_summary_id:
             await tg_call_with_retry(lambda: context.application.bot.send_message(chat_id=dest_summary_id, text=summary), what="send_summary")
         elif dest_evidencias_id:
-            # Si no hay summary, enviamos resumen a evidencias por compat
             await tg_call_with_retry(lambda: context.application.bot.send_message(chat_id=dest_evidencias_id, text=summary), what="send_summary_to_evidence")
     except Exception as e:
         logging.exception("⚠️ Falló envío de RESUMEN a Telegram (se continúa).")
         telegram_send_errors.append(f"Resumen: {e}")
 
-    # Enviar media a evidencias si existe
     if dest_evidencias_id:
         try:
             await send_media_section(context.application, dest_evidencias_id, "🧱 FACHADA", s_["fachada"]["media"])
@@ -2310,17 +2474,18 @@ async def on_final_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.exception("⚠️ Falló envío sección OPCIONALES (se continúa).")
                 telegram_send_errors.append(f"Opcionales: {e}")
 
-    # Mensaje final al grupo origen
     try:
         msg = (
             f"✅ SE FINALIZÓ SUPERVISIÓN\n"
             f"🧾 Código: {s_.get('codigo','')}\n"
             f"📌 Estado: Completado\n"
+            f"✅ Estado final: {s_.get('estado_final','')}\n"
+            f"🏙️ Distrito: {s_.get('distrito_supervision','')}\n"
             f"📊 Sheets: {'OK' if sheets_ok else 'PENDIENTE/ERROR'}"
         )
         if telegram_send_errors:
             msg += "\n\n⚠️ Nota: Hubo demoras/errores al enviar evidencias a Telegram (flood control). Revisa logs."
-        await send_message(update, context, msg)
+        await tg_call_with_retry(lambda: context.application.bot.send_message(chat_id=origin_chat_id, text=msg), what="send_final_origin")
     except Exception:
         pass
 
@@ -2337,15 +2502,12 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_message(update, context, "❌ No hay una supervisión activa para cancelar.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
-    # Marcar cancelación
     s_["fecha_cierre"] = now_peru_str()
     s_["estado"] = "No Completado"
     s_["cancelado_por"] = str(update.effective_user.id if update.effective_user else "")
-    s_["expecting_codigo"] = False  # ✅ FIX: al cancelar, no esperar código
-    # Motivo opcional (si luego quieres pedirlo). Aquí lo dejamos vacío por ahora.
+    s_["expecting_codigo"] = False
     s_["motivo_cancelacion"] = s_.get("motivo_cancelacion", "")
 
-    # Guardar en Sheets al cancelar (fila parcial)
     if _gs_ready():
         try:
             payload = build_supervisiones_v2_row(s_, estado="No Completado", motivo_cancelacion=s_.get("motivo_cancelacion", ""))
@@ -2434,7 +2596,6 @@ async def on_cfg_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(query, txt, reply_markup=CFG_MENU_KB)
         return S_CFG_MENU
 
-    # Vincular evidencias / resumen: el destino debe pegar un código
     if query.data in ("CFG_LINK_EVID", "CFG_LINK_SUMM"):
         purpose = "EVIDENCE" if query.data == "CFG_LINK_EVID" else "SUMMARY"
         context.chat_data["cfg_purpose"] = purpose
@@ -2449,9 +2610,6 @@ async def on_cfg_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_CFG_MENU
 
 async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    El DESTINO pega un código. Se valida/consume y se actualiza ROUTING.
-    """
     if not update.message or not update.message.text:
         await send_message(update, context, "❌ Pega el código en texto.")
         return S_CFG_WAIT_CODE
@@ -2468,7 +2626,6 @@ async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        # Buscar code en PAIRING
         ws = gs_ws(SHEET_TAB_PAIRING)
         headers = gs_headers(SHEET_TAB_PAIRING)
         h2i = {h: i for i, h in enumerate(headers)}
@@ -2521,7 +2678,6 @@ async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_message(update, context, "❌ Código inválido (sin origin_chat_id).")
             return ConversationHandler.END
 
-        # Consumir código: used=1 + used_by/used_at
         patch_pair = {
             "used": "1",
             "used_by": str(update.effective_user.id if update.effective_user else ""),
@@ -2529,7 +2685,6 @@ async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         gs_update_row_by_headers(SHEET_TAB_PAIRING, found_row_idx, patch_pair)
 
-        # Actualizar ROUTING (crear si no existe)
         dest_chat_id = update.effective_chat.id
 
         row_idx_route = gs_find_row_index_first(SHEET_TAB_ROUTING, {"origin_chat_id": origin_chat_id})
@@ -2547,10 +2702,8 @@ async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_idx_route:
             gs_update_row_by_headers(SHEET_TAB_ROUTING, row_idx_route, patch_route)
         else:
-            # append nueva fila con headers (lo que no exista se ignora)
             gs_append_dict(SHEET_TAB_ROUTING, patch_route)
 
-        # refrescar cache routing
         load_routing_cache(force=True)
 
         await send_message(
@@ -2569,17 +2722,7 @@ async def on_cfg_wait_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_message(update, context, f"❌ Error vinculando.\nDetalle: {e}")
         return ConversationHandler.END
 
-async def on_cfg_back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await safe_edit_or_send(query, "⚙️ CONFIGURACIÓN", reply_markup=CFG_MENU_KB)
-    return S_CFG_MENU
-
 async def cmd_config_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Opción alternativa: /config_origin para ORIGEN (admin) y generar códigos.
-    (No es obligatoria, pero útil si quieres separar menús).
-    """
     if not in_group(update):
         await send_message(update, context, "Usa /config_origin dentro de un grupo.")
         return ConversationHandler.END
@@ -2591,9 +2734,6 @@ async def cmd_config_origin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_CFG_MENU
 
 async def on_cfg_origin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Generación de códigos (en ORIGEN) para Evidencias/Resumen.
-    """
     query = update.callback_query
     await query.answer()
 
@@ -2641,6 +2781,84 @@ async def on_cfg_origin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return S_CFG_MENU
 
 # =========================
+# Resumen diario automático (6.1)
+# =========================
+def _safe_date_from_str(s: str) -> Optional[str]:
+    # espera "YYYY-MM-DD HH:MM:SS" o "YYYY-MM-DD"
+    ss = (s or "").strip()
+    if not ss:
+        return None
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", ss)
+    return m.group(1) if m else None
+
+def build_daily_summary_text(records: List[Dict[str, Any]], day_ymd: str) -> str:
+    total = len(records)
+    by_operador: Dict[str, int] = {}
+    by_estado_final: Dict[str, int] = {}
+    by_supervisor: Dict[str, int] = {}
+
+    for r in records:
+        op = str(r.get("Operador", "")).strip() or "N/D"
+        ef = str(r.get("Estado_Final", "")).strip() or str(r.get("Estado final", "")).strip() or "N/D"
+        sup = str(r.get("Supervisor", "")).strip() or "N/D"
+        by_operador[op] = by_operador.get(op, 0) + 1
+        by_estado_final[ef] = by_estado_final.get(ef, 0) + 1
+        by_supervisor[sup] = by_supervisor.get(sup, 0) + 1
+
+    def fmt_map(d: Dict[str, int], top: int = 10) -> str:
+        items = sorted(d.items(), key=lambda x: (-x[1], _norm(x[0])))
+        items = items[:top]
+        return "\n".join([f"• {k}: {v}" for k, v in items]) if items else "• (sin data)"
+
+    return (
+        f"📊 RESUMEN DIARIO ({day_ymd})\n\n"
+        f"Total supervisiones: {total}\n\n"
+        f"Por operador:\n{fmt_map(by_operador)}\n\n"
+        f"Estado final:\n{fmt_map(by_estado_final)}\n\n"
+        f"Top supervisores:\n{fmt_map(by_supervisor)}"
+    )
+
+async def job_send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    if not DAILY_SUMMARY_ENABLED:
+        return
+    if not _gs_ready():
+        logging.warning("Resumen diario: Sheets no configurado.")
+        return
+
+    day = date_peru_ymd()
+    try:
+        recs = gs_get_all_records(SHEET_TAB_SUPERVISIONES_V2)
+    except Exception as e:
+        logging.warning(f"Resumen diario: no pude leer Supervisiones_v2: {e}")
+        return
+
+    # Filtrar por día (Fecha_Creacion)
+    day_recs = []
+    for r in recs:
+        d = _safe_date_from_str(str(r.get("Fecha_Creacion", "")).strip())
+        if d == day:
+            day_recs.append(r)
+
+    text = build_daily_summary_text(day_recs, day)
+
+    routes = load_routing_cache(force=True)  # refrescar
+    for origin_str, route in (routes or {}).items():
+        try:
+            if not route.get("activo"):
+                continue
+            origin_id = _parse_int_chat_id(origin_str)
+            if origin_id is None:
+                continue
+            dest = route_dest_summary(origin_id)
+            if dest is None and DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY:
+                dest = origin_id
+            if dest is None:
+                continue
+            await tg_call_with_retry(lambda cid=dest: context.application.bot.send_message(chat_id=cid, text=text), what="daily_summary_send")
+        except Exception as e:
+            logging.warning(f"Resumen diario: fallo enviando a origin={origin_str}: {e}")
+
+# =========================
 # Error handler
 # =========================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -2662,8 +2880,6 @@ def main():
     app.add_handler(CommandHandler("reload_sheet", cmd_reload_sheet))
 
     # ---- /config routing/pairing
-    # Nota: /config gestiona DESTINO (pega código) y ver rutas.
-    # /config_origin (opcional) gestiona ORIGEN (genera códigos).
     cfg_conv = ConversationHandler(
         entry_points=[CommandHandler("config", cmd_config), CommandHandler("config_origin", cmd_config_origin)],
         per_chat=True,
@@ -2699,13 +2915,11 @@ def main():
         states={
             S_SUPERVISOR: [CallbackQueryHandler(on_pick_supervisor, pattern=r"^SUP_(PICK\|\d+|NONE)$")],
 
-            # Paso 2: operador (y técnico TU FIBRA en el mismo estado)
             S_OPERADOR: [
                 CallbackQueryHandler(on_pick_operador, pattern=r"^OP_\d+$"),
                 CallbackQueryHandler(on_pick_tecnico_tufibra, pattern=r"^(TF_PICK\|\d+|TF_NONE)$"),
             ],
 
-            # WIN: búsqueda + botones
             S_WIN_CUADRILLA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_win_cuadrilla_text),
                 CallbackQueryHandler(on_win_pick_match, pattern=r"^WIN_PICK\|\d+$"),
@@ -2714,6 +2928,13 @@ def main():
 
             S_CODIGO: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_codigo)],
             S_TIPO: [CallbackQueryHandler(on_pick_tipo, pattern=r"^TIPO_")],
+
+            # NUEVO: distrito
+            S_DISTRITO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_distrito_text),
+                CallbackQueryHandler(on_distrito_pick, pattern=r"^(DIST_PICK\|\d+|DIST_REFINE|DIST_CANCEL)$"),
+            ],
+
             S_UBICACION: [MessageHandler(filters.LOCATION, on_location)],
 
             S_FACHADA_MEDIA: [
@@ -2736,20 +2957,33 @@ def main():
             S_ASK_OBS: [CallbackQueryHandler(on_obs_choice, pattern=r"^OBS_")],
             S_WRITE_OBS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_write_obs)],
 
+            # NUEVO: confirmación antes de finalizar
+            S_CONFIRM_FINISH: [CallbackQueryHandler(on_confirm_finish, pattern=r"^(FIN_OK|FIN_NO)$")],
+
             S_FINAL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_final_text)],
+            S_ESTADO_FINAL: [CallbackQueryHandler(on_pick_estado_final, pattern=r"^EF_")],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
         allow_reentry=True,
     )
 
-    # 0) Primero el ConversationHandler principal
     app.add_handler(conv, group=1)
 
-    # 1) Rescate de código (si el ConversationHandler no lo toma)
+    # Rescate de código
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, codigo_global), group=2)
 
-    # 2) Captura de plantilla (va después del rescate)
+    # Captura de plantilla
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_capture_plantilla), group=3)
+
+    # JobQueue: Resumen diario (6.1)
+    if DAILY_SUMMARY_ENABLED:
+        # Corre todos los días a la hora configurada (Perú)
+        app.job_queue.run_daily(
+            job_send_daily_summary,
+            time=dtime(hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE, tzinfo=PERU_TZ),
+            name="daily_summary",
+        )
+        logging.info("🗓️ Resumen diario programado: %02d:%02d (Perú)", DAILY_SUMMARY_HOUR, DAILY_SUMMARY_MINUTE)
 
     logging.info("✅ Bot iniciado. Polling...")
 
@@ -2761,3 +2995,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
