@@ -2073,7 +2073,7 @@ async def on_distrito_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return S_UBICACION
 
-    async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_ = sess(context)
     loc = update.message.location if update.message else None
     if not loc:
@@ -3166,8 +3166,8 @@ async def on_cfg_origin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("Error generando código")
         await safe_edit_or_send(query, f"❌ No pude generar código.\nDetalle: {e}", reply_markup=CFG_ORIGIN_KB())
         return S_CFG_MENU
-    
-    # =========================
+
+# =========================
 # Resumen diario automático (6.1)
 # =========================
 def _safe_date_from_str(s: str) -> Optional[str]:
@@ -3383,4 +3383,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
