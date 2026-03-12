@@ -3351,6 +3351,75 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.exception("Unhandled error:", exc_info=context.error)
 
 # =========================
+# Comando manual cierre diario
+# =========================
+async def cmd_cierre_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_group(update):
+        await send_message(update, context, "Usa /cierre_hoy dentro de un grupo.")
+        return
+
+    if not await is_admin(update, context):
+        await send_message(update, context, "⛔ Solo administradores pueden usar /cierre_hoy.")
+        return
+
+    if not _gs_ready():
+        await send_message(update, context, "⚠️ Sheets no está configurado.")
+        return
+
+    day = date_peru_ymd()
+
+    try:
+        recs = gs_get_all_records(SHEET_TAB_SUPERVISIONES_V2)
+    except Exception as e:
+        await send_message(update, context, f"❌ No pude leer Supervisiones_v2.\nDetalle: {e}")
+        return
+
+    day_recs: List[Dict[str, Any]] = []
+    for r in recs:
+        d = _safe_date_from_str(str(r.get("Fecha_Creacion", "")).strip())
+        estado = str(r.get("ESTADO", "")).strip().lower()
+        if d == day and estado == "completado":
+            day_recs.append(r)
+
+    if not day_recs:
+        await send_message(update, context, f"ℹ️ No hay supervisiones completadas para {day}.")
+        return
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in day_recs:
+        origin = str(r.get("Origin_Chat_ID", "")).strip()
+        if not origin:
+            continue
+        grouped.setdefault(origin, []).append(r)
+
+    enviados = 0
+    errores = 0
+
+    for origin_str, group_records in grouped.items():
+        try:
+            dest = _parse_int_chat_id(origin_str)
+            if dest is None:
+                errores += 1
+                continue
+
+            text = build_daily_summary_text(group_records, day)
+
+            await tg_call_with_retry(
+                lambda cid=dest, txt=text: context.application.bot.send_message(chat_id=cid, text=txt),
+                what="manual_cierre_hoy_send",
+            )
+            enviados += 1
+        except Exception as e:
+            logging.warning(f"/cierre_hoy fallo enviando a origin={origin_str}: {e}")
+            errores += 1
+
+    await send_message(
+        update,
+        context,
+        f"✅ /cierre_hoy ejecutado.\nGrupos enviados: {enviados}\nErrores: {errores}"
+    )
+
+# =========================
 # main()
 # =========================
 def main():
@@ -3363,6 +3432,7 @@ def main():
     app.add_handler(CommandHandler("plantilla", cmd_plantilla))
     app.add_handler(CommandHandler("cancelar_plantilla", cmd_cancelar_plantilla))
     app.add_handler(CommandHandler("reload_sheet", cmd_reload_sheet))
+    app.add_handler(CommandHandler("cierre_hoy", cmd_cierre_hoy))
 
     cfg_conv = ConversationHandler(
         entry_points=[CommandHandler("config", cmd_config), CommandHandler("config_origin", cmd_config_origin)],
