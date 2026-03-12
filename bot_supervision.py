@@ -13,7 +13,7 @@
 #   $env:SHEET_TAB_DISTRITOS="DISTRITOS"
 #   $env:SHEET_TAB_ROUTING="ROUTING"
 #   $env:SHEET_TAB_PAIRING="PAIRING"
-#   $env:GOOGLE_CREDS_JSON_TEXT=(Get-Content google_creds.json -Raw)   # recomendado en Railway
+#   $env:GOOGLE_CREDS_JSON_TEXT=(Get-Content google_creds.json -Raw)
 #   python bot_supervision.py
 #
 # IMPORTANTE:
@@ -39,6 +39,14 @@
 # 1.1 Confirmación antes de finalizar (botones Sí/No antes de cerrar)
 # Estado final con botones: CORRECTA / OBSERVADA (se guarda en Supervisiones_v2 -> Estado_Final)
 # 6.1 Resumen diario automático (JobQueue): envía resumen diario a los destinos de RESUMEN por ROUTING
+# 7.1 Información de Supervisión:
+#    - Metraje de drop externo (ubicación CTO + ubicación domicilio + metraje)
+#    - Metraje de drop interno
+#    - Cantidad de postes usados
+#    - Cantidad de falsos tramos
+#    - Cantidad aproximada de templadores
+#    - Captura de recorrido
+#    - Validación final: La información del técnico en acta es correcta (SI/NO)
 
 import os
 import re
@@ -56,7 +64,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import gspread
 from google.oauth2.service_account import Credentials
 
-from PIL import Image, ImageDraw, ImageFont  # watermark (queda instalado, pero por defecto desactivado)
+from PIL import Image, ImageDraw, ImageFont
 
 from telegram import (
     Update,
@@ -88,12 +96,6 @@ logging.basicConfig(
 # CAPTURA DE ERRORES "SILENCIOSOS" (Railway/PTB)
 # =========================
 def _install_global_exception_handlers() -> None:
-    """
-    Captura:
-    - Excepciones no manejadas del proceso (sys.excepthook)
-    - Excepciones no manejadas en el event loop de asyncio
-    Esto ayuda a ver el "error real" que provoca que el bot se detenga.
-    """
     def _excepthook(exc_type, exc, tb):
         logging.critical("UNHANDLED EXCEPTION (sys.excepthook)", exc_info=(exc_type, exc, tb))
         try:
@@ -134,64 +136,46 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_TAB_PLANTILLAS = os.getenv("SHEET_TAB_PLANTILLAS", "Plantillas").strip()
-
-# ✅ Supervisiones_v2
 SHEET_TAB_SUPERVISIONES_V2 = os.getenv("SHEET_TAB_SUPERVISIONES_V2", "Supervisiones_v2").strip()
 
-# ✅ Listas dinámicas
 SHEET_TAB_SUPERVISORES = os.getenv("SHEET_TAB_SUPERVISORES", "SUPERVISORES").strip()
 SHEET_TAB_TECNICOS_TUFIBRA = os.getenv("SHEET_TAB_TECNICOS_TUFIBRA", "TECNICOS_TUFIBRA").strip()
 SHEET_TAB_CUADRILLAS_WIN = os.getenv("SHEET_TAB_CUADRILLAS_WIN", "CUADRILLAS_WIN").strip()
 SHEET_TAB_DISTRITOS = os.getenv("SHEET_TAB_DISTRITOS", "DISTRITOS").strip()
 
-# ✅ Routing/pairing
 SHEET_TAB_ROUTING = os.getenv("SHEET_TAB_ROUTING", "ROUTING").strip()
 SHEET_TAB_PAIRING = os.getenv("SHEET_TAB_PAIRING", "PAIRING").strip()
 
-# Cache/refresh
-SUP_CACHE_TTL_SEC = int(os.getenv("SUP_CACHE_TTL_SEC", "180"))              # 3 min default
-ROUTING_CACHE_TTL_SEC = int(os.getenv("ROUTING_CACHE_TTL_SEC", "180"))      # 3 min default
-PAIRING_TTL_MINUTES = int(os.getenv("PAIRING_TTL_MINUTES", "10"))           # 10 min default
-CUAD_CACHE_TTL_SEC = int(os.getenv("CUAD_CACHE_TTL_SEC", "180"))            # 3 min default (CUADRILLAS_WIN)
-DIST_CACHE_TTL_SEC = int(os.getenv("DIST_CACHE_TTL_SEC", "180"))            # 3 min default (DISTRITOS)
+SUP_CACHE_TTL_SEC = int(os.getenv("SUP_CACHE_TTL_SEC", "180"))
+ROUTING_CACHE_TTL_SEC = int(os.getenv("ROUTING_CACHE_TTL_SEC", "180"))
+PAIRING_TTL_MINUTES = int(os.getenv("PAIRING_TTL_MINUTES", "10"))
+CUAD_CACHE_TTL_SEC = int(os.getenv("CUAD_CACHE_TTL_SEC", "180"))
+DIST_CACHE_TTL_SEC = int(os.getenv("DIST_CACHE_TTL_SEC", "180"))
 
-# Resumen diario automático (hora Perú)
 DAILY_SUMMARY_ENABLED = os.getenv("DAILY_SUMMARY_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "20"))             # 20:00 por defecto
+DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "20"))
 DAILY_SUMMARY_MINUTE = int(os.getenv("DAILY_SUMMARY_MINUTE", "0"))
 DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY = os.getenv("DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY", "true").lower() in ("1", "true", "yes", "y")
 
-# WIN UX
-WIN_SUGGEST_MAX = int(os.getenv("WIN_SUGGEST_MAX", "6"))                    # máximo 6 sugerencias
-WIN_BUTTONS_MAX = 5                                                        # >5 => mostrar 5 + "Refinar búsqueda"
+WIN_SUGGEST_MAX = int(os.getenv("WIN_SUGGEST_MAX", "6"))
+WIN_BUTTONS_MAX = 5
 
-# Distritos UX
 DIST_SUGGEST_MAX = int(os.getenv("DIST_SUGGEST_MAX", "8"))
 DIST_BUTTONS_MAX = 6
 
-# En Railway: NO subas google_creds.json al repo.
-# Usa GOOGLE_CREDS_JSON_TEXT (contenido JSON completo).
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "google_creds.json").strip()
 GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 
-# ⚠️ Fallback temporal opcional para migración de ROUTING (si lo necesitas)
-# Formato esperado:
-# {"-100123":{"evidence":"-100999","summary":"-100888"}}
 ROUTING_JSON = os.getenv("ROUTING_JSON", "").strip()
 
 MAX_MEDIA_PER_BUCKET = int(os.getenv("MAX_MEDIA_PER_BUCKET", "8"))
 
-# =========================
-# Watermark (DESACTIVADO por defecto para bajar 429)
-# =========================
 ENABLE_WATERMARK_PHOTOS = os.getenv("ENABLE_WATERMARK_PHOTOS", "false").lower() in ("1", "true", "yes", "y")
-WM_DIR = os.getenv("WM_DIR", "wm_tmp").strip()  # Railway recomendado: /tmp/wm_tmp
+WM_DIR = os.getenv("WM_DIR", "wm_tmp").strip()
 WM_FONT_SIZE = int(os.getenv("WM_FONT_SIZE", "22"))
 
-# UX anti-spam media notify
 MEDIA_NOTIFY_DEBOUNCE_SEC = float(os.getenv("MEDIA_NOTIFY_DEBOUNCE_SEC", "1.0"))
 
-# Telegram retry policy
 TG_MAX_RETRIES = int(os.getenv("TG_MAX_RETRIES", "5"))
 TG_RETRY_JITTER_SEC = float(os.getenv("TG_RETRY_JITTER_SEC", "0.7"))
 
@@ -217,10 +201,6 @@ def date_peru_ymd(dt: Optional[datetime] = None) -> str:
 # Telegram: wrapper con reintentos (RetryAfter/429)
 # =========================
 async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
-    """
-    Ejecuta una llamada async a Telegram con reintentos si ocurre RetryAfter (flood control).
-    - coro_factory: lambda: <awaitable>
-    """
     last_exc = None
     for attempt in range(1, TG_MAX_RETRIES + 1):
         try:
@@ -251,10 +231,10 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
 (
     S_SUPERVISOR,
     S_OPERADOR,
-    S_WIN_CUADRILLA,        # WIN: búsqueda/selección de cuadrilla
+    S_WIN_CUADRILLA,
     S_CODIGO,
     S_TIPO,
-    S_DISTRITO,             # NUEVO: elegir distrito (búsqueda + botones)
+    S_DISTRITO,
     S_UBICACION,
     S_FACHADA_MEDIA,
     S_MENU_PRINCIPAL,
@@ -263,13 +243,22 @@ async def tg_call_with_retry(coro_factory, *, what: str = "telegram_call"):
     S_CARGA_MEDIA_BUCKET,
     S_ASK_OBS,
     S_WRITE_OBS,
-    S_CONFIRM_FINISH,       # NUEVO: confirmación antes de finalizar
+    S_CONFIRM_FINISH,
     S_FINAL_TEXT,
-    S_ESTADO_FINAL,         # NUEVO: CORRECTA / OBSERVADA
-    # /config flow
+    S_ESTADO_FINAL,
+    S_MENU_INFO,
+    S_INFO_DROP_EXT_CTO,
+    S_INFO_DROP_EXT_DOM,
+    S_INFO_DROP_EXT_METRAJE,
+    S_INFO_DROP_INT,
+    S_INFO_POSTES,
+    S_INFO_FALSOS,
+    S_INFO_TEMPLADORES,
+    S_INFO_RECORRIDO_MEDIA,
+    S_INFO_ACTA_CONFIRM,
     S_CFG_MENU,
     S_CFG_WAIT_CODE,
-) = range(19)
+) = range(29)
 
 # =========================
 # MENUS / OPCIONES
@@ -303,15 +292,27 @@ CUADRILLA_ITEMS = [
     ("12. FINALIZAR EVIDENCIAS", "FIN_CUADRILLA"),
 ]
 
+INFO_ITEMS = [
+    ("1. Metraje de drop externo", "INFO_DROP_EXT"),
+    ("2. Metraje de drop interno", "INFO_DROP_INT"),
+    ("3. Cantidad de postes usados", "INFO_POSTES"),
+    ("4. Cantidad de falsos tramos", "INFO_FALSOS"),
+    ("5. Cantidad aproximada de templadores", "INFO_TEMPLADORES"),
+    ("6. Captura de recorrido", "INFO_RECORRIDO"),
+    ("⬅️ Volver", "INFO_VOLVER"),
+]
+
 MAIN_MENU = [
     ("🏗️EVIDENCIAS DE CABLEADO", "MENU_CABLEADO"),
     ("👷‍♂️EVIDENCIAS DE CUADRILLA", "MENU_CUADRILLA"),
     ("🚨EVIDENCIAS OPCIONALES", "MENU_OPCIONALES"),
+    ("📋INFORMACION DE SUPERVISION", "MENU_INFO"),
     ("✅FINALIZAR SUPERVISION", "FINALIZAR"),
 ]
 
 CABLEADO_PATTERN = r"^(CTO|POSTE|RUTA|FALSO_TRAMO|ANCLAJE|RESERVA|ROSETA|EQUIPOS|FIN_CABLEADO)$"
 CUADRILLA_PATTERN = r"^(FOTO_TECNICOS|SCTR|ATS|LICENCIA|UNIDAD|SOAT|HERRAMIENTAS|KIT_FIBRA|ESCALERA_TEL|ESCALERA_INT|BOTIQUIN|FIN_CUADRILLA)$"
+INFO_PATTERN = r"^(INFO_DROP_EXT|INFO_DROP_INT|INFO_POSTES|INFO_FALSOS|INFO_TEMPLADORES|INFO_RECORRIDO|INFO_VOLVER)$"
 
 # =========================
 # Helpers UI
@@ -500,7 +501,7 @@ def gs_get_all_records(tab_name: str) -> List[Dict[str, Any]]:
 def gs_find_row_index_first(tab_name: str, criteria: Dict[str, str]) -> Optional[int]:
     ws = gs_ws(tab_name)
     headers = gs_headers(tab_name)
-    header_to_idx = {h: i for i, h in enumerate(headers)}  # 0-based
+    header_to_idx = {h: i for i, h in enumerate(headers)}
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return None
@@ -524,7 +525,7 @@ def gs_find_row_index_first(tab_name: str, criteria: Dict[str, str]) -> Optional
 def gs_update_row_by_headers(tab_name: str, row_index: int, patch: Dict[str, Any]) -> None:
     ws = gs_ws(tab_name)
     headers = gs_headers(tab_name)
-    header_to_col = {h: i + 1 for i, h in enumerate(headers)}  # 1-based col
+    header_to_col = {h: i + 1 for i, h in enumerate(headers)}
     for k, v in patch.items():
         if k in header_to_col:
             ws.update_cell(row_index, header_to_col[k], str(v) if v is not None else "")
@@ -855,14 +856,6 @@ def fetch_cuadrillas_win(ttl_sec: int) -> List[Dict[str, Any]]:
     return items
 
 def fetch_distritos(ttl_sec: int) -> List[Dict[str, Any]]:
-    """
-    Lee DISTRITOS con columnas:
-      - distrito (obligatorio)
-      - alias (opcional, separado por ;)
-      - zona (opcional)
-      - activo (1/0)
-      - orden (num)
-    """
     now = time.time()
     c = _DYN_CACHE.get("distritos", {"ts": 0.0, "items": []})
     if c["items"] and (now - float(c["ts"])) < ttl_sec:
@@ -886,7 +879,6 @@ def fetch_distritos(ttl_sec: int) -> List[Dict[str, Any]]:
             except Exception:
                 orden = 999999
 
-            # Normalizados para match rápido
             alias_tokens = []
             if alias:
                 for a in alias.split(";"):
@@ -1034,12 +1026,6 @@ def win_build_buttons(matches: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     return kb_inline(opts, cols=1)
 
 def dist_find_matches(query: str) -> List[Dict[str, Any]]:
-    """
-    Match híbrido:
-    - exact/substring en distrito
-    - exact/substring en alias (cada token separado por ;)
-    - ranking por score + orden
-    """
     items = fetch_distritos(DIST_CACHE_TTL_SEC)
     q = (query or "").strip()
     qn = _norm(q)
@@ -1057,11 +1043,9 @@ def dist_find_matches(query: str) -> List[Dict[str, Any]]:
         if qn in dn:
             ok = True
         else:
-            # alias contiene query
             if any(qn in a for a in aliases):
                 ok = True
             else:
-                # todos los tokens deben aparecer en distrito o alias
                 if toks:
                     def token_ok(t: str) -> bool:
                         if t in dn:
@@ -1073,7 +1057,6 @@ def dist_find_matches(query: str) -> List[Dict[str, Any]]:
         if not ok:
             continue
 
-        # scoring
         score = 0
         distrito = it.get("distrito", "")
         if dn.startswith(qn):
@@ -1122,7 +1105,7 @@ def dist_build_buttons(matches: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
 # =========================
 # ROUTING CACHE + helpers
 # =========================
-_ROUTING_CACHE: Dict[str, Any] = {"ts": 0.0, "routes": {}}  # origin_chat_id -> route dict
+_ROUTING_CACHE: Dict[str, Any] = {"ts": 0.0, "routes": {}}
 
 def _parse_int_chat_id(v: Any) -> Optional[int]:
     try:
@@ -1231,8 +1214,8 @@ def sess(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     if "s" not in context.user_data:
         context.user_data["s"] = {
             "id_supervision": str(uuid.uuid4()),
-            "estado": "",  # Completado / No Completado
-            "estado_final": "",  # CORRECTA / OBSERVADA
+            "estado": "",
+            "estado_final": "",
             "fecha_creacion": now_peru_str(),
             "fecha_cierre": "",
             "created_by": "",
@@ -1249,21 +1232,18 @@ def sess(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
             "codigo": None,
             "tipo": None,
 
-            # NUEVO: distrito (PASO 5)
             "distrito_supervision": "",
             "dist_query_last": "",
             "dist_matches": [],
 
-            "location": None,    # (lat, lon)
+            "location": None,
             "final_text": "",
 
             "expecting_codigo": False,
 
-            # WIN UX
             "win_query_last": "",
             "win_matches": [],
 
-            # media items
             "fachada": {"media": [], "obs": ""},
             "cableado": {},
             "cuadrilla": {},
@@ -1271,13 +1251,32 @@ def sess(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
             "current_section": None,
             "current_bucket": None,
 
-            # plantillas link
             "plantilla_uuid": "",
             "plantilla_contrata": "",
             "plantilla_distrito": "",
             "plantilla_gestor": "",
 
-            # UX anti-spam media notify
+            "info_supervision": {
+                "Drop_Externo_CTO_Latitud": "",
+                "Drop_Externo_CTO_Longitud": "",
+                "Drop_Externo_CTO_Link_Ubicacion": "",
+                "Drop_Externo_Domicilio_Latitud": "",
+                "Drop_Externo_Domicilio_Longitud": "",
+                "Drop_Externo_Domicilio_Link_Ubicacion": "",
+                "Metraje_Drop_Externo": "",
+                "Metraje_Drop_Interno": "",
+                "Cantidad_Postes_Usados": "",
+                "Cantidad_Falsos_Tramos": "",
+                "Cantidad_Templadores_Aprox": "",
+                "Captura_Recorrido_Obs": "",
+                "Captura_Recorrido_Cargado": "",
+                "Updated_At_Info_Supervision": "",
+                "Info_Tecnico_Acta_Correcta": "",
+                "recorrido_media": None,
+                "drop_ext_cto_location": None,
+                "drop_ext_dom_location": None,
+            },
+
             "media_notify_task": None,
             "media_notify_last_msg_id": None,
             "media_notify_last_text": "",
@@ -1327,6 +1326,16 @@ def cleanup_session_temp_files(s_: Dict[str, Any]) -> None:
 
         for item in s_.get("opcionales", {}).get("media", []):
             p = item.get("wm_file")
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+        info_sup = s_.get("info_supervision", {})
+        rec = info_sup.get("recorrido_media")
+        if isinstance(rec, dict):
+            p = rec.get("wm_file")
             if p and os.path.exists(p):
                 try:
                     os.remove(p)
@@ -1400,7 +1409,7 @@ async def apply_watermark_photo_if_needed(
             tw, th = int(draw.textlength(text, font=font)), WM_FONT_SIZE + 6
 
         x = 10
-        y = im.height - th - padding*2 - 10
+        y = im.height - th - padding * 2 - 10
         rect = [x - 5, y - 5, x + tw + padding, y + th + padding]
 
         draw.rectangle(rect, fill=(0, 0, 0))
@@ -1417,6 +1426,124 @@ async def apply_watermark_photo_if_needed(
     except Exception as e:
         logging.warning(f"No se pudo aplicar watermark: {e}")
         return file_id, None
+
+# =========================
+# Info Supervisión helpers
+# =========================
+def maps_link_from_latlon(lat: Optional[float], lon: Optional[float]) -> str:
+    if lat is None or lon is None:
+        return ""
+    return f"https://maps.google.com/?q={lat},{lon}"
+
+def _parse_decimal(text: str) -> Optional[float]:
+    t = (text or "").strip().replace(",", ".")
+    if not re.fullmatch(r"\d+(\.\d+)?", t):
+        return None
+    try:
+        v = float(t)
+        if v < 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+def _parse_non_negative_int(text: str) -> Optional[int]:
+    t = (text or "").strip()
+    if not re.fullmatch(r"\d+", t):
+        return None
+    try:
+        v = int(t)
+        if v < 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+def _info_missing_fields(s_: Dict[str, Any]) -> List[str]:
+    info = s_.get("info_supervision", {})
+    missing = []
+
+    if not info.get("Drop_Externo_CTO_Latitud") or not info.get("Drop_Externo_CTO_Longitud"):
+        missing.append("Metraje de drop externo -> ubicación CTO")
+    if not info.get("Drop_Externo_Domicilio_Latitud") or not info.get("Drop_Externo_Domicilio_Longitud"):
+        missing.append("Metraje de drop externo -> ubicación domicilio")
+    if str(info.get("Metraje_Drop_Externo", "")).strip() == "":
+        missing.append("Metraje de drop externo")
+    if str(info.get("Metraje_Drop_Interno", "")).strip() == "":
+        missing.append("Metraje de drop interno")
+    if str(info.get("Cantidad_Postes_Usados", "")).strip() == "":
+        missing.append("Cantidad de postes usados")
+    if str(info.get("Cantidad_Falsos_Tramos", "")).strip() == "":
+        missing.append("Cantidad de falsos tramos")
+    if str(info.get("Cantidad_Templadores_Aprox", "")).strip() == "":
+        missing.append("Cantidad aproximada de templadores")
+    if str(info.get("Captura_Recorrido_Cargado", "")).strip().upper() != "SI":
+        missing.append("Captura de recorrido")
+
+    return missing
+
+def is_info_supervision_complete(s_: Dict[str, Any]) -> bool:
+    return len(_info_missing_fields(s_)) == 0
+
+def build_info_menu_text(s_: Dict[str, Any]) -> str:
+    info = s_.get("info_supervision", {})
+
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "⬜"
+
+    cto_ok = bool(info.get("Drop_Externo_CTO_Latitud")) and bool(info.get("Drop_Externo_CTO_Longitud"))
+    dom_ok = bool(info.get("Drop_Externo_Domicilio_Latitud")) and bool(info.get("Drop_Externo_Domicilio_Longitud"))
+    drop_ext_ok = cto_ok and dom_ok and str(info.get("Metraje_Drop_Externo", "")).strip() != ""
+    drop_int_ok = str(info.get("Metraje_Drop_Interno", "")).strip() != ""
+    postes_ok = str(info.get("Cantidad_Postes_Usados", "")).strip() != ""
+    falsos_ok = str(info.get("Cantidad_Falsos_Tramos", "")).strip() != ""
+    templ_ok = str(info.get("Cantidad_Templadores_Aprox", "")).strip() != ""
+    reco_ok = str(info.get("Captura_Recorrido_Cargado", "")).strip().upper() == "SI"
+    acta_val = str(info.get("Info_Tecnico_Acta_Correcta", "")).strip().upper()
+
+    acta_txt = "Pendiente"
+    if acta_val in ("SI", "NO"):
+        acta_txt = acta_val
+
+    return (
+        "📋 INFORMACION DE SUPERVISION\n\n"
+        f"{mark(drop_ext_ok)} Metraje de drop externo\n"
+        f"{mark(drop_int_ok)} Metraje de drop interno\n"
+        f"{mark(postes_ok)} Cantidad de postes usados\n"
+        f"{mark(falsos_ok)} Cantidad de falsos tramos\n"
+        f"{mark(templ_ok)} Cantidad aproximada de templadores\n"
+        f"{mark(reco_ok)} Captura de recorrido\n"
+        f"{'✅' if acta_val in ('SI', 'NO') else '⬜'} Info técnico en acta correcta: {acta_txt}\n\n"
+        "Selecciona una opción:"
+    )
+
+async def _return_to_info_menu(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    text = build_info_menu_text(s_)
+    reply_markup = kb_inline(INFO_ITEMS, cols=1)
+
+    if hasattr(update_or_query, "edit_message_text"):
+        await safe_edit_or_send(update_or_query, text, reply_markup=reply_markup)
+    else:
+        await send_message(update_or_query, context, text, reply_markup=reply_markup)
+    return S_MENU_INFO
+
+async def _after_info_field_saved(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    info = s_.get("info_supervision", {})
+    info["Updated_At_Info_Supervision"] = now_peru_str()
+
+    if is_info_supervision_complete(s_):
+        if str(info.get("Info_Tecnico_Acta_Correcta", "")).strip().upper() not in ("SI", "NO"):
+            text = "La informacion del tecnico en acta es correcta"
+            kb = kb_inline([("SI", "ACTA_SI"), ("NO", "ACTA_NO")], cols=2)
+            if hasattr(update_or_query, "edit_message_text"):
+                await safe_edit_or_send(update_or_query, text, reply_markup=kb)
+            else:
+                await send_message(update_or_query, context, text, reply_markup=kb)
+            return S_INFO_ACTA_CONFIRM
+
+    return await _return_to_info_menu(update_or_query, context)
 
 # =========================
 # UX anti-spam: notify aggregated media count
@@ -1791,7 +1918,6 @@ async def on_pick_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return S_TIPO
 
-    # NUEVO PASO 5: DISTRITO
     s_["dist_query_last"] = ""
     s_["dist_matches"] = []
 
@@ -1947,7 +2073,7 @@ async def on_distrito_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return S_UBICACION
 
-async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_ = sess(context)
     loc = update.message.location if update.message else None
     if not loc:
@@ -2140,8 +2266,28 @@ async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(query, f"🚨 EVIDENCIAS OPCIONALES\n📸🎥 Carga entre 1 a {MAX_MEDIA_PER_BUCKET} archivos.", reply_markup=None)
         return S_CARGA_MEDIA_BUCKET
 
+    if query.data == "MENU_INFO":
+        s_["current_section"] = None
+        s_["current_bucket"] = None
+        await safe_edit_or_send(query, build_info_menu_text(s_), reply_markup=kb_inline(INFO_ITEMS, cols=1))
+        return S_MENU_INFO
+
     if query.data == "FINALIZAR":
-        # 1.1 Confirmación antes de finalizar
+        missing = _info_missing_fields(s_)
+        if missing:
+            txt = "⚠️ Antes de finalizar debes completar INFORMACION DE SUPERVISION:\n\n" + "\n".join([f"• {x}" for x in missing])
+            txt += "\n\nVe a 📋INFORMACION DE SUPERVISION y completa los campos pendientes."
+            await safe_edit_or_send(query, txt, reply_markup=kb_inline(MAIN_MENU, cols=1))
+            return S_MENU_PRINCIPAL
+
+        if str(s_.get("info_supervision", {}).get("Info_Tecnico_Acta_Correcta", "")).strip().upper() not in ("SI", "NO"):
+            await safe_edit_or_send(
+                query,
+                "La informacion del tecnico en acta es correcta",
+                reply_markup=kb_inline([("SI", "ACTA_SI"), ("NO", "ACTA_NO")], cols=2),
+            )
+            return S_INFO_ACTA_CONFIRM
+
         await safe_edit_or_send(
             query,
             "⚠️ Confirmación\n\n¿Deseas FINALIZAR la supervisión?\n\n"
@@ -2151,20 +2297,6 @@ async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_CONFIRM_FINISH
 
     return S_MENU_PRINCIPAL
-
-async def on_confirm_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "FIN_NO":
-        await safe_edit_or_send(query, "✅ Continúa cargando evidencias.\n\nPASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
-        return S_MENU_PRINCIPAL
-
-    if query.data == "FIN_OK":
-        await safe_edit_or_send(query, "INGRESAR OBSERVACIONES FINALES\n(Escribe el texto final)", reply_markup=None)
-        return S_FINAL_TEXT
-
-    return S_CONFIRM_FINISH
 
 async def on_menu_cableado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2209,6 +2341,216 @@ async def on_menu_cuadrilla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_CARGA_MEDIA_BUCKET
 
 # =========================
+# Menú Información de Supervisión
+# =========================
+async def on_menu_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    s_ = sess(context)
+    data = query.data or ""
+
+    if data == "INFO_VOLVER":
+        await safe_edit_or_send(query, "PASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        return S_MENU_PRINCIPAL
+
+    if data == "INFO_DROP_EXT":
+        txt = (
+            "1️⃣ METRAJE DE DROP EXTERNO\n\n"
+            "Primero envía la ubicación de la CTO.\n\n"
+            "📌 Enviar así:\n"
+            "1) Clip 📎\n"
+            "2) Ubicación\n"
+            "3) Enviar ubicación actual"
+        )
+        await safe_edit_or_send(query, txt, reply_markup=None)
+        return S_INFO_DROP_EXT_CTO
+
+    if data == "INFO_DROP_INT":
+        await safe_edit_or_send(
+            query,
+            "2️⃣ METRAJE DE DROP INTERNO\n\nIngresa el metraje en número.\nEjemplo: 18 o 18.5",
+            reply_markup=None,
+        )
+        return S_INFO_DROP_INT
+
+    if data == "INFO_POSTES":
+        await safe_edit_or_send(
+            query,
+            "3️⃣ CANTIDAD DE POSTES USADOS\n\nIngresa solo un número entero.\nEjemplo: 3",
+            reply_markup=None,
+        )
+        return S_INFO_POSTES
+
+    if data == "INFO_FALSOS":
+        await safe_edit_or_send(
+            query,
+            "4️⃣ CANTIDAD DE FALSOS TRAMOS\n\nIngresa solo un número entero.\nEjemplo: 2",
+            reply_markup=None,
+        )
+        return S_INFO_FALSOS
+
+    if data == "INFO_TEMPLADORES":
+        await safe_edit_or_send(
+            query,
+            "5️⃣ CANTIDAD APROXIMADA DE TEMPLADORES\n\nIngresa solo un número entero.\nEjemplo: 4",
+            reply_markup=None,
+        )
+        return S_INFO_TEMPLADORES
+
+    if data == "INFO_RECORRIDO":
+        s_["current_section"] = None
+        s_["current_bucket"] = None
+        await safe_edit_or_send(
+            query,
+            "6️⃣ CAPTURA DE RECORRIDO\n\nEnvía 1 archivo (foto o video) del recorrido.",
+            reply_markup=None,
+        )
+        return S_INFO_RECORRIDO_MEDIA
+
+    return S_MENU_INFO
+
+async def on_info_drop_ext_cto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    loc = update.message.location if update.message else None
+    if not loc:
+        await send_message(update, context, "❌ Debes enviar la ubicación de la CTO.")
+        return S_INFO_DROP_EXT_CTO
+
+    info = s_["info_supervision"]
+    info["drop_ext_cto_location"] = (loc.latitude, loc.longitude)
+    info["Drop_Externo_CTO_Latitud"] = f"{loc.latitude:.15f}"
+    info["Drop_Externo_CTO_Longitud"] = f"{loc.longitude:.15f}"
+    info["Drop_Externo_CTO_Link_Ubicacion"] = maps_link_from_latlon(loc.latitude, loc.longitude)
+
+    await send_message(
+        update,
+        context,
+        "✅ Ubicación CTO guardada.\n\nAhora envía la ubicación del domicilio.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return S_INFO_DROP_EXT_DOM
+
+async def on_info_drop_ext_dom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    loc = update.message.location if update.message else None
+    if not loc:
+        await send_message(update, context, "❌ Debes enviar la ubicación del domicilio.")
+        return S_INFO_DROP_EXT_DOM
+
+    info = s_["info_supervision"]
+    info["drop_ext_dom_location"] = (loc.latitude, loc.longitude)
+    info["Drop_Externo_Domicilio_Latitud"] = f"{loc.latitude:.15f}"
+    info["Drop_Externo_Domicilio_Longitud"] = f"{loc.longitude:.15f}"
+    info["Drop_Externo_Domicilio_Link_Ubicacion"] = maps_link_from_latlon(loc.latitude, loc.longitude)
+
+    await send_message(
+        update,
+        context,
+        "✅ Ubicación domicilio guardada.\n\nAhora ingresa el metraje del drop externo.\nEjemplo: 35 o 35.5",
+    )
+    return S_INFO_DROP_EXT_METRAJE
+
+async def on_info_drop_ext_metraje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    v = _parse_decimal(update.message.text if update.message else "")
+    if v is None:
+        await send_message(update, context, "❌ Valor inválido. Ingresa solo número.\nEjemplo: 35 o 35.5")
+        return S_INFO_DROP_EXT_METRAJE
+
+    s_["info_supervision"]["Metraje_Drop_Externo"] = str(v).rstrip("0").rstrip(".") if "." in str(v) else str(v)
+    return await _after_info_field_saved(update, context)
+
+async def on_info_drop_int(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    v = _parse_decimal(update.message.text if update.message else "")
+    if v is None:
+        await send_message(update, context, "❌ Valor inválido. Ingresa solo número.\nEjemplo: 18 o 18.5")
+        return S_INFO_DROP_INT
+
+    s_["info_supervision"]["Metraje_Drop_Interno"] = str(v).rstrip("0").rstrip(".") if "." in str(v) else str(v)
+    return await _after_info_field_saved(update, context)
+
+async def on_info_postes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    v = _parse_non_negative_int(update.message.text if update.message else "")
+    if v is None:
+        await send_message(update, context, "❌ Valor inválido. Ingresa solo un número entero.\nEjemplo: 3")
+        return S_INFO_POSTES
+
+    s_["info_supervision"]["Cantidad_Postes_Usados"] = str(v)
+    return await _after_info_field_saved(update, context)
+
+async def on_info_falsos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    v = _parse_non_negative_int(update.message.text if update.message else "")
+    if v is None:
+        await send_message(update, context, "❌ Valor inválido. Ingresa solo un número entero.\nEjemplo: 2")
+        return S_INFO_FALSOS
+
+    s_["info_supervision"]["Cantidad_Falsos_Tramos"] = str(v)
+    return await _after_info_field_saved(update, context)
+
+async def on_info_templadores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    v = _parse_non_negative_int(update.message.text if update.message else "")
+    if v is None:
+        await send_message(update, context, "❌ Valor inválido. Ingresa solo un número entero.\nEjemplo: 4")
+        return S_INFO_TEMPLADORES
+
+    s_["info_supervision"]["Cantidad_Templadores_Aprox"] = str(v)
+    return await _after_info_field_saved(update, context)
+
+async def on_info_recorrido_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s_ = sess(context)
+    item = extract_media_from_message(update)
+    if not item:
+        await send_message(update, context, "❌ Envía una foto o video para la captura de recorrido.")
+        return S_INFO_RECORRIDO_MEDIA
+
+    if item["type"] == "photo" and ENABLE_WATERMARK_PHOTOS:
+        lat, lon = s_.get("location") if s_.get("location") else (None, None)
+        sent_dt = now_peru_str()
+        _, wm_path = await apply_watermark_photo_if_needed(
+            context.application,
+            item["file_id"],
+            lat,
+            lon,
+            sent_dt_local=sent_dt,
+        )
+        if wm_path:
+            item["wm_file"] = wm_path
+
+    info = s_["info_supervision"]
+    info["recorrido_media"] = item
+    info["Captura_Recorrido_Cargado"] = "SI"
+
+    return await _after_info_field_saved(update, context)
+
+async def on_info_acta_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    s_ = sess(context)
+
+    if query.data == "ACTA_SI":
+        s_["info_supervision"]["Info_Tecnico_Acta_Correcta"] = "SI"
+    elif query.data == "ACTA_NO":
+        s_["info_supervision"]["Info_Tecnico_Acta_Correcta"] = "NO"
+    else:
+        return S_INFO_ACTA_CONFIRM
+
+    s_["info_supervision"]["Updated_At_Info_Supervision"] = now_peru_str()
+
+    if is_info_supervision_complete(s_):
+        await safe_edit_or_send(
+            query,
+            "✅ Información de supervisión completa.\n\nPASO 8 - ELEGIR SIGUIENTE PASO",
+            reply_markup=kb_inline(MAIN_MENU, cols=1),
+        )
+        return S_MENU_PRINCIPAL
+
+    return await _return_to_info_menu(query, context)
+
+# =========================
 # Finalización: Estado final + guardar/enviar
 # =========================
 def build_summary(s_: Dict[str, Any]) -> str:
@@ -2225,6 +2567,19 @@ def build_summary(s_: Dict[str, Any]) -> str:
             f"• PlantillaUUID: {s_.get('plantilla_uuid','')}\n"
         )
 
+    info = s_.get("info_supervision", {})
+    info_block = (
+        "\n📋 Información de Supervisión:\n"
+        f"• Drop externo: {info.get('Metraje_Drop_Externo','')}\n"
+        f"• Drop interno: {info.get('Metraje_Drop_Interno','')}\n"
+        f"• Postes usados: {info.get('Cantidad_Postes_Usados','')}\n"
+        f"• Falsos tramos: {info.get('Cantidad_Falsos_Tramos','')}\n"
+        f"• Templadores aprox.: {info.get('Cantidad_Templadores_Aprox','')}\n"
+        f"• Info técnico en acta correcta: {info.get('Info_Tecnico_Acta_Correcta','')}\n"
+        f"• CTO: {info.get('Drop_Externo_CTO_Link_Ubicacion','')}\n"
+        f"• Domicilio: {info.get('Drop_Externo_Domicilio_Link_Ubicacion','')}\n"
+    )
+
     return (
         "📋 SUPERVISIÓN FINALIZADA\n\n"
         f"👷 Supervisor: {s_.get('supervisor','')}\n"
@@ -2235,7 +2590,8 @@ def build_summary(s_: Dict[str, Any]) -> str:
         f"🏙️ Distrito (Supervisión): {s_.get('distrito_supervision','')}\n"
         f"✅ Estado final: {s_.get('estado_final','')}\n\n"
         f"📍 Ubicación:\n{maps_direct}\n"
-        f"{extra}\n"
+        f"{extra}"
+        f"{info_block}\n"
         "📝 Observaciones finales:\n"
         f"{s_.get('final_text','')}"
     )
@@ -2293,21 +2649,17 @@ def map_obs_columns_v2() -> Dict[Tuple[str, str], str]:
         ("cuadrilla", "BOTIQUIN"): "Obs_BOTIQUIN",
     }
 
-def maps_link_from_latlon(lat: Optional[float], lon: Optional[float]) -> str:
-    if lat is None or lon is None:
-        return ""
-    return f"https://maps.google.com/?q={lat},{lon}"
-
 def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelacion: str = "") -> Dict[str, Any]:
     lat, lon = s_["location"] if s_.get("location") else (None, None)
     origin_chat_id = s_.get("origin_chat_id")
     ev_chat_id = s_.get("evidence_chat_id")
     su_chat_id = s_.get("summary_chat_id")
+    info = s_.get("info_supervision", {})
 
     row: Dict[str, Any] = {}
     row["ID_Supervision"] = s_.get("id_supervision", "")
     row["ESTADO"] = estado
-    row["Estado_Final"] = s_.get("estado_final", "")  # NUEVO
+    row["Estado_Final"] = s_.get("estado_final", "")
     row["Fecha_Creacion"] = s_.get("fecha_creacion", "")
     row["Fecha_Cierre"] = s_.get("fecha_cierre", now_peru_str())
 
@@ -2319,7 +2671,6 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
     row["Código_Pedido"] = s_.get("codigo", "")
     row["Tipo_Supervision"] = s_.get("tipo", "")
 
-    # Distrito (nuevo flujo) + mantener distrito de plantilla en otra columna si existe
     row["Distrito"] = s_.get("distrito_supervision", "") or s_.get("plantilla_distrito", "")
     row["Distrito_Plantilla"] = s_.get("plantilla_distrito", "")
 
@@ -2341,6 +2692,22 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
     row["Obs_ADICIONALES"] = s_.get("opcionales", {}).get("obs", "")
     row["Obs_FINALES"] = s_.get("final_text", "")
 
+    row["Drop_Externo_CTO_Latitud"] = info.get("Drop_Externo_CTO_Latitud", "")
+    row["Drop_Externo_CTO_Longitud"] = info.get("Drop_Externo_CTO_Longitud", "")
+    row["Drop_Externo_CTO_Link_Ubicacion"] = info.get("Drop_Externo_CTO_Link_Ubicacion", "")
+    row["Drop_Externo_Domicilio_Latitud"] = info.get("Drop_Externo_Domicilio_Latitud", "")
+    row["Drop_Externo_Domicilio_Longitud"] = info.get("Drop_Externo_Domicilio_Longitud", "")
+    row["Drop_Externo_Domicilio_Link_Ubicacion"] = info.get("Drop_Externo_Domicilio_Link_Ubicacion", "")
+    row["Metraje_Drop_Externo"] = info.get("Metraje_Drop_Externo", "")
+    row["Metraje_Drop_Interno"] = info.get("Metraje_Drop_Interno", "")
+    row["Cantidad_Postes_Usados"] = info.get("Cantidad_Postes_Usados", "")
+    row["Cantidad_Falsos_Tramos"] = info.get("Cantidad_Falsos_Tramos", "")
+    row["Cantidad_Templadores_Aprox"] = info.get("Cantidad_Templadores_Aprox", "")
+    row["Captura_Recorrido_Obs"] = info.get("Captura_Recorrido_Obs", "")
+    row["Captura_Recorrido_Cargado"] = info.get("Captura_Recorrido_Cargado", "")
+    row["Updated_At_Info_Supervision"] = info.get("Updated_At_Info_Supervision", "")
+    row["Info_Tecnico_Acta_Correcta"] = info.get("Info_Tecnico_Acta_Correcta", "")
+
     row["PlantillaUUID"] = s_.get("plantilla_uuid", "")
     row["Origin_Chat_ID"] = str(origin_chat_id) if origin_chat_id is not None else ""
     row["Evidence_Chat_ID"] = str(ev_chat_id) if ev_chat_id is not None else ""
@@ -2353,11 +2720,24 @@ def build_supervisiones_v2_row(s_: Dict[str, Any], estado: str, motivo_cancelaci
 
     return row
 
+async def on_confirm_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "FIN_NO":
+        await safe_edit_or_send(query, "✅ Continúa cargando evidencias.\n\nPASO 8 - ELEGIR SIGUIENTE PASO", reply_markup=kb_inline(MAIN_MENU, cols=1))
+        return S_MENU_PRINCIPAL
+
+    if query.data == "FIN_OK":
+        await safe_edit_or_send(query, "INGRESAR OBSERVACIONES FINALES\n(Escribe el texto final)", reply_markup=None)
+        return S_FINAL_TEXT
+
+    return S_CONFIRM_FINISH
+
 async def on_final_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_ = sess(context)
     s_["final_text"] = (update.message.text or "").strip()
 
-    # NUEVO: pedir Estado final (botones)
     await send_message(
         update,
         context,
@@ -2424,7 +2804,6 @@ async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYP
                 pass
 
     summary = build_summary(s_)
-
     telegram_send_errors: List[str] = []
 
     try:
@@ -2474,6 +2853,14 @@ async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYP
                 logging.exception("⚠️ Falló envío sección OPCIONALES (se continúa).")
                 telegram_send_errors.append(f"Opcionales: {e}")
 
+        recorrido_item = s_.get("info_supervision", {}).get("recorrido_media")
+        if isinstance(recorrido_item, dict):
+            try:
+                await send_media_section(context.application, dest_evidencias_id, "🗺️ CAPTURA DE RECORRIDO", [recorrido_item])
+            except Exception as e:
+                logging.exception("⚠️ Falló envío CAPTURA DE RECORRIDO (se continúa).")
+                telegram_send_errors.append(f"Recorrido: {e}")
+
     try:
         msg = (
             f"✅ SE FINALIZÓ SUPERVISIÓN\n"
@@ -2494,7 +2881,7 @@ async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # =========================
-# Cancelar supervisión (guardar fila parcial con ESTADO=No Completado)
+# Cancelar supervisión
 # =========================
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s_ = context.user_data.get("s")
@@ -2779,12 +3166,11 @@ async def on_cfg_origin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("Error generando código")
         await safe_edit_or_send(query, f"❌ No pude generar código.\nDetalle: {e}", reply_markup=CFG_ORIGIN_KB())
         return S_CFG_MENU
-
-# =========================
+    
+    # =========================
 # Resumen diario automático (6.1)
 # =========================
 def _safe_date_from_str(s: str) -> Optional[str]:
-    # espera "YYYY-MM-DD HH:MM:SS" o "YYYY-MM-DD"
     ss = (s or "").strip()
     if not ss:
         return None
@@ -2832,7 +3218,6 @@ async def job_send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
         logging.warning(f"Resumen diario: no pude leer Supervisiones_v2: {e}")
         return
 
-    # Filtrar por día (Fecha_Creacion)
     day_recs = []
     for r in recs:
         d = _safe_date_from_str(str(r.get("Fecha_Creacion", "")).strip())
@@ -2841,7 +3226,7 @@ async def job_send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
     text = build_daily_summary_text(day_recs, day)
 
-    routes = load_routing_cache(force=True)  # refrescar
+    routes = load_routing_cache(force=True)
     for origin_str, route in (routes or {}).items():
         try:
             if not route.get("activo"):
@@ -2874,12 +3259,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_error_handler(on_error)
 
-    # ---- comandos sheets/plantillas
     app.add_handler(CommandHandler("plantilla", cmd_plantilla))
     app.add_handler(CommandHandler("cancelar_plantilla", cmd_cancelar_plantilla))
     app.add_handler(CommandHandler("reload_sheet", cmd_reload_sheet))
 
-    # ---- /config routing/pairing
     cfg_conv = ConversationHandler(
         entry_points=[CommandHandler("config", cmd_config), CommandHandler("config_origin", cmd_config_origin)],
         per_chat=True,
@@ -2929,7 +3312,6 @@ def main():
             S_CODIGO: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_codigo)],
             S_TIPO: [CallbackQueryHandler(on_pick_tipo, pattern=r"^TIPO_")],
 
-            # NUEVO: distrito
             S_DISTRITO: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_distrito_text),
                 CallbackQueryHandler(on_distrito_pick, pattern=r"^(DIST_PICK\|\d+|DIST_REFINE|DIST_CANCEL)$"),
@@ -2957,9 +3339,20 @@ def main():
             S_ASK_OBS: [CallbackQueryHandler(on_obs_choice, pattern=r"^OBS_")],
             S_WRITE_OBS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_write_obs)],
 
-            # NUEVO: confirmación antes de finalizar
-            S_CONFIRM_FINISH: [CallbackQueryHandler(on_confirm_finish, pattern=r"^(FIN_OK|FIN_NO)$")],
+            S_MENU_INFO: [
+                CallbackQueryHandler(on_menu_info, pattern=r"^(INFO_DROP_EXT|INFO_DROP_INT|INFO_POSTES|INFO_FALSOS|INFO_TEMPLADORES|INFO_RECORRIDO|INFO_VOLVER)$"),
+            ],
+            S_INFO_DROP_EXT_CTO: [MessageHandler(filters.LOCATION, on_info_drop_ext_cto)],
+            S_INFO_DROP_EXT_DOM: [MessageHandler(filters.LOCATION, on_info_drop_ext_dom)],
+            S_INFO_DROP_EXT_METRAJE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_info_drop_ext_metraje)],
+            S_INFO_DROP_INT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_info_drop_int)],
+            S_INFO_POSTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_info_postes)],
+            S_INFO_FALSOS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_info_falsos)],
+            S_INFO_TEMPLADORES: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_info_templadores)],
+            S_INFO_RECORRIDO_MEDIA: [MessageHandler(media_filter, on_info_recorrido_media)],
+            S_INFO_ACTA_CONFIRM: [CallbackQueryHandler(on_info_acta_confirm, pattern=r"^(ACTA_SI|ACTA_NO)$")],
 
+            S_CONFIRM_FINISH: [CallbackQueryHandler(on_confirm_finish, pattern=r"^(FIN_OK|FIN_NO)$")],
             S_FINAL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_final_text)],
             S_ESTADO_FINAL: [CallbackQueryHandler(on_pick_estado_final, pattern=r"^EF_")],
         },
@@ -2969,15 +3362,10 @@ def main():
 
     app.add_handler(conv, group=1)
 
-    # Rescate de código
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, codigo_global), group=2)
-
-    # Captura de plantilla
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_capture_plantilla), group=3)
 
-    # JobQueue: Resumen diario (6.1)
     if DAILY_SUMMARY_ENABLED:
-        # Corre todos los días a la hora configurada (Perú)
         app.job_queue.run_daily(
             job_send_daily_summary,
             time=dtime(hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE, tzinfo=PERU_TZ),
