@@ -197,6 +197,24 @@ def date_peru_ymd(dt: Optional[datetime] = None) -> str:
     d = (dt or now_peru_dt()).astimezone(PERU_TZ)
     return d.strftime("%Y-%m-%d")
 
+def format_duration_between(start_str: str, end_str: str) -> str:
+    try:
+        dt_start = datetime.strptime(str(start_str).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PERU_TZ)
+        dt_end = datetime.strptime(str(end_str).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PERU_TZ)
+        total_seconds = max(0, int((dt_end - dt_start).total_seconds()))
+    except Exception:
+        return "N/D"
+
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    if hours > 0:
+        return f"{hours} h {minutes} min {seconds} seg"
+    if minutes > 0:
+        return f"{minutes} min {seconds} seg"
+    return f"{seconds} seg"
+
 # =========================
 # Telegram: wrapper con reintentos (RetryAfter/429)
 # =========================
@@ -2091,7 +2109,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_message(
         update,
         context,
-        f"PASO 7 - EVIDENCIA DE FACHADA\n📸🎥 Carga entre 1 a {MAX_MEDIA_PER_BUCKET} archivos (fotos o videos).",
+        f"PASO 7 - SELFIE EN FACHADA DE CLIENTE\n📸🎥 Carga entre 1 a {MAX_MEDIA_PER_BUCKET} archivos (fotos o videos).",
         reply_markup=ReplyKeyboardRemove(),
     )
     return S_FACHADA_MEDIA
@@ -2787,6 +2805,11 @@ async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYP
 
     s_["fecha_cierre"] = now_peru_str()
     s_["estado"] = "Completado"
+    
+    duracion_txt = format_duration_between(
+        s_.get("fecha_creacion", ""),
+        s_.get("fecha_cierre", "")
+    )
 
     sheets_ok = False
     if _gs_ready():
@@ -2868,6 +2891,7 @@ async def on_pick_estado_final(update: Update, context: ContextTypes.DEFAULT_TYP
             f"📌 Estado: Completado\n"
             f"✅ Estado final: {s_.get('estado_final','')}\n"
             f"🏙️ Distrito: {s_.get('distrito_supervision','')}\n"
+            f"⏱️ Duración: {duracion_txt}\n"
             f"📊 Sheets: {'OK' if sheets_ok else 'PENDIENTE/ERROR'}"
         )
         if telegram_send_errors:
@@ -3177,31 +3201,93 @@ def _safe_date_from_str(s: str) -> Optional[str]:
     m = re.match(r"^(\d{4}-\d{2}-\d{2})", ss)
     return m.group(1) if m else None
 
+def _parse_peru_dt(s: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PERU_TZ)
+    except Exception:
+        return None
+
+def _format_total_duration(seconds_total: int) -> str:
+    seconds_total = max(0, int(seconds_total))
+    hours = seconds_total // 3600
+    minutes = (seconds_total % 3600) // 60
+
+    if hours > 0:
+        if minutes > 0:
+            return f"{hours} horas {minutes} min"
+        return f"{hours} horas"
+    return f"{minutes} min"
+
+def _fmt_count_map(d: Dict[str, int], top: Optional[int] = None) -> str:
+    items = sorted(d.items(), key=lambda x: (-x[1], _norm(x[0])))
+    if top is not None:
+        items = items[:top]
+    return "\n".join([f"• {k}: {v}" for k, v in items]) if items else "• (sin data)"
+
+def _fmt_percent_map(d: Dict[str, int], total: int) -> str:
+    items = sorted(d.items(), key=lambda x: (-x[1], _norm(x[0])))
+    out = []
+    for k, v in items:
+        pct = round((v / total) * 100) if total > 0 else 0
+        out.append(f"• {k}: {v} ({pct}%)")
+    return "\n".join(out) if out else "• (sin data)"
+
 def build_daily_summary_text(records: List[Dict[str, Any]], day_ymd: str) -> str:
     total = len(records)
-    by_operador: Dict[str, int] = {}
+
     by_estado_final: Dict[str, int] = {}
-    by_supervisor: Dict[str, int] = {}
+    by_operador: Dict[str, int] = {}
+    by_tipo: Dict[str, int] = {}
+    by_distrito: Dict[str, int] = {}
+    by_tecnico: Dict[str, int] = {}
+
+    total_duration_sec = 0
+    min_inicio: Optional[datetime] = None
+    max_fin: Optional[datetime] = None
 
     for r in records:
-        op = str(r.get("Operador", "")).strip() or "N/D"
-        ef = str(r.get("Estado_Final", "")).strip() or str(r.get("Estado final", "")).strip() or "N/D"
-        sup = str(r.get("Supervisor", "")).strip() or "N/D"
-        by_operador[op] = by_operador.get(op, 0) + 1
-        by_estado_final[ef] = by_estado_final.get(ef, 0) + 1
-        by_supervisor[sup] = by_supervisor.get(sup, 0) + 1
+        estado_final = str(r.get("Estado_Final", "")).strip() or "N/D"
+        operador = str(r.get("Operador", "")).strip() or "N/D"
+        tipo = str(r.get("Tipo_Supervision", "")).strip() or "N/D"
+        distrito = str(r.get("Distrito", "")).strip() or "N/D"
+        tecnico = str(r.get("Técnico", "")).strip() or "N/D"
 
-    def fmt_map(d: Dict[str, int], top: int = 10) -> str:
-        items = sorted(d.items(), key=lambda x: (-x[1], _norm(x[0])))
-        items = items[:top]
-        return "\n".join([f"• {k}: {v}" for k, v in items]) if items else "• (sin data)"
+        by_estado_final[estado_final] = by_estado_final.get(estado_final, 0) + 1
+        by_operador[operador] = by_operador.get(operador, 0) + 1
+        by_tipo[tipo] = by_tipo.get(tipo, 0) + 1
+        by_distrito[distrito] = by_distrito.get(distrito, 0) + 1
+        by_tecnico[tecnico] = by_tecnico.get(tecnico, 0) + 1
+
+        dt_ini = _parse_peru_dt(str(r.get("Fecha_Creacion", "")).strip())
+        dt_fin = _parse_peru_dt(str(r.get("Fecha_Cierre", "")).strip())
+
+        if dt_ini:
+            if min_inicio is None or dt_ini < min_inicio:
+                min_inicio = dt_ini
+
+        if dt_fin:
+            if max_fin is None or dt_fin > max_fin:
+                max_fin = dt_fin
+
+        if dt_ini and dt_fin and dt_fin >= dt_ini:
+            total_duration_sec += int((dt_fin - dt_ini).total_seconds())
+
+    inicio_txt = min_inicio.strftime("%H:%M") if min_inicio else "N/D"
+    fin_txt = max_fin.strftime("%H:%M") if max_fin else "N/D"
+    duracion_txt = _format_total_duration(total_duration_sec)
 
     return (
-        f"📊 RESUMEN DIARIO ({day_ymd})\n\n"
-        f"Total supervisiones: {total}\n\n"
-        f"Por operador:\n{fmt_map(by_operador)}\n\n"
-        f"Estado final:\n{fmt_map(by_estado_final)}\n\n"
-        f"Top supervisores:\n{fmt_map(by_supervisor)}"
+        f"📊 CIERRE DEL DIA ({day_ymd})\n\n"
+        f"Total supervisiones: {total}\n"
+        f"⏱️ Duración total de supervisiones: {duracion_txt}\n\n"
+        f"Estado final:\n{_fmt_percent_map(by_estado_final, total)}\n\n"
+        f"Por operador:\n{_fmt_count_map(by_operador)}\n\n"
+        f"Tipo Supervisión:\n{_fmt_count_map(by_tipo)}\n\n"
+        f"Distritos supervisados:\n{_fmt_count_map(by_distrito)}\n\n"
+        f"Técnicos supervisados:\n{_fmt_count_map(by_tecnico, top=10)}\n\n"
+        f"🕒 Jornada\n"
+        f"Inicio: {inicio_txt}\n"
+        f"Fin: {fin_txt}"
     )
 
 async def job_send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
@@ -3212,36 +3298,51 @@ async def job_send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
         return
 
     day = date_peru_ymd()
+
     try:
         recs = gs_get_all_records(SHEET_TAB_SUPERVISIONES_V2)
     except Exception as e:
         logging.warning(f"Resumen diario: no pude leer Supervisiones_v2: {e}")
         return
 
-    day_recs = []
+    # Solo registros del día y completados
+    day_recs: List[Dict[str, Any]] = []
     for r in recs:
         d = _safe_date_from_str(str(r.get("Fecha_Creacion", "")).strip())
-        if d == day:
+        estado = str(r.get("ESTADO", "")).strip().lower()
+        if d == day and estado == "completado":
             day_recs.append(r)
 
-    text = build_daily_summary_text(day_recs, day)
+    if not day_recs:
+        logging.info("Resumen diario: no hay supervisiones completadas para %s", day)
+        return
 
-    routes = load_routing_cache(force=True)
-    for origin_str, route in (routes or {}).items():
+    # Agrupar por Origin_Chat_ID
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in day_recs:
+        origin = str(r.get("Origin_Chat_ID", "")).strip()
+        if not origin:
+            continue
+        grouped.setdefault(origin, []).append(r)
+
+    if not grouped:
+        logging.info("Resumen diario: no hay grupos con Origin_Chat_ID válido para %s", day)
+        return
+
+    for origin_str, group_records in grouped.items():
         try:
-            if not route.get("activo"):
-                continue
-            origin_id = _parse_int_chat_id(origin_str)
-            if origin_id is None:
-                continue
-            dest = route_dest_summary(origin_id)
-            if dest is None and DAILY_SUMMARY_SEND_TO_ORIGIN_IF_NO_SUMMARY:
-                dest = origin_id
+            dest = _parse_int_chat_id(origin_str)
             if dest is None:
                 continue
-            await tg_call_with_retry(lambda cid=dest: context.application.bot.send_message(chat_id=cid, text=text), what="daily_summary_send")
+
+            text = build_daily_summary_text(group_records, day)
+
+            await tg_call_with_retry(
+                lambda cid=dest, txt=text: context.application.bot.send_message(chat_id=cid, text=txt),
+                what="daily_summary_send_by_origin",
+            )
         except Exception as e:
-            logging.warning(f"Resumen diario: fallo enviando a origin={origin_str}: {e}")
+            logging.warning(f"Resumen diario: fallo enviando cierre a origin={origin_str}: {e}")
 
 # =========================
 # Error handler
