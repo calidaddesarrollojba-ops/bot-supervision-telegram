@@ -13,6 +13,7 @@
 #   $env:SHEET_TAB_DISTRITOS="DISTRITOS"
 #   $env:SHEET_TAB_ROUTING="ROUTING"
 #   $env:SHEET_TAB_PAIRING="PAIRING"
+#   $env:SHEET_TAB_ALMUERZOS="ALMUERZOS"
 #   $env:GOOGLE_CREDS_JSON_TEXT=(Get-Content google_creds.json -Raw)
 #   python bot_supervision.py
 #
@@ -145,6 +146,7 @@ SHEET_TAB_DISTRITOS = os.getenv("SHEET_TAB_DISTRITOS", "DISTRITOS").strip()
 
 SHEET_TAB_ROUTING = os.getenv("SHEET_TAB_ROUTING", "ROUTING").strip()
 SHEET_TAB_PAIRING = os.getenv("SHEET_TAB_PAIRING", "PAIRING").strip()
+SHEET_TAB_ALMUERZOS = os.getenv("SHEET_TAB_ALMUERZOS", "ALMUERZOS").strip()
 
 SUP_CACHE_TTL_SEC = int(os.getenv("SUP_CACHE_TTL_SEC", "180"))
 ROUTING_CACHE_TTL_SEC = int(os.getenv("ROUTING_CACHE_TTL_SEC", "180"))
@@ -346,6 +348,14 @@ def kb_inline(options: List[Tuple[str, str]], cols: int = 2) -> InlineKeyboardMa
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
+
+ALMUERZO_CONFIRM_KB = kb_inline(
+    [
+        ("SI", "ALM_INICIO_SI"),
+        ("NO", "ALM_INICIO_NO"),
+    ],
+    cols=2,
+)
 
 def evidence_controls_keyboard() -> InlineKeyboardMarkup:
     return kb_inline(
@@ -551,6 +561,77 @@ def gs_update_row_by_headers(tab_name: str, row_index: int, patch: Dict[str, Any
 def gs_delete_row(tab_name: str, row_index: int) -> None:
     ws = gs_ws(tab_name)
     ws.delete_rows(row_index)
+
+# =========================
+# ALMUERZOS HELPERS
+# =========================
+
+def almuerzo_abierto(user_id: int):
+    if not _gs_ready():
+        return None
+
+    try:
+        recs = gs_get_all_records(SHEET_TAB_ALMUERZOS)
+    except Exception:
+        return None
+
+    for r in reversed(recs):
+        if str(r.get("Supervisor_ID", "")).strip() == str(user_id):
+            if str(r.get("Hora_Fin", "")).strip() == "":
+                return r
+
+    return None
+
+def registrar_inicio_almuerzo(user_id: int, chat_id: int, supervisor: str):
+    row = {
+        "Fecha": date_peru_ymd(),
+        "Supervisor": supervisor,
+        "Supervisor_ID": str(user_id),
+        "Chat_ID": str(chat_id),
+        "Hora_Inicio": now_peru_str(),
+        "Hora_Fin": "",
+        "Duracion": "",
+        "Estado": "EN_CURSO",
+        "Creado_En": now_peru_str(),
+    }
+
+    gs_append_dict(SHEET_TAB_ALMUERZOS, row)
+
+def cerrar_almuerzo(user_id: int):
+    recs = gs_get_all_records(SHEET_TAB_ALMUERZOS)
+
+    for r in reversed(recs):
+        if str(r.get("Supervisor_ID", "")).strip() == str(user_id):
+            if str(r.get("Hora_Fin", "")).strip() == "":
+                inicio = r.get("Hora_Inicio", "")
+
+                fin = now_peru_str()
+
+                duracion = format_duration_between(inicio, fin)
+
+                row_idx = gs_find_row_index_first(
+                    SHEET_TAB_ALMUERZOS,
+                    {
+                        "Supervisor_ID": str(user_id),
+                        "Hora_Inicio": inicio,
+                    },
+                )
+
+                if row_idx:
+                    gs_update_row_by_headers(
+                        SHEET_TAB_ALMUERZOS,
+                        row_idx,
+                        {
+                            "Hora_Fin": fin,
+                            "Duracion": duracion,
+                            "Estado": "FINALIZADO",
+                        },
+                    )
+
+                hora_inicio = inicio[11:16] if inicio else ""
+                return hora_inicio, duracion
+
+    return "", "N/D"
 
 # =========================
 # Plantillas: template + parse
@@ -1620,6 +1701,23 @@ def _cancel_media_notify_task(s_: Dict[str, Any]):
 async def inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_group(update):
         await send_message(update, context, "Este bot se usa desde un grupo AUDITORIAS_... (no en privado).")
+        return ConversationHandler.END
+
+    if not _gs_ready():
+        await send_message(update, context, "⚠️ Google Sheets no está configurado.")
+        return ConversationHandler.END
+
+    almuerzo = almuerzo_abierto(update.effective_user.id)
+    if almuerzo:
+        hora_inicio = str(almuerzo.get("Hora_Inicio", "")).strip()
+        hora_txt = hora_inicio[11:16] if len(hora_inicio) >= 16 else hora_inicio
+        await send_message(
+            update,
+            context,
+            f"⛔ No puedes iniciar una supervisión porque tienes un almuerzo en curso.\n"
+            f"🕒 Inicio de almuerzo: {hora_txt or 'N/D'}\n\n"
+            "Primero debes ejecutar /fin_almuerzo."
+        )
         return ConversationHandler.END
 
     context.user_data.pop("s", None)
@@ -3420,6 +3518,127 @@ async def cmd_cierre_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
+# COMANDOS ALMUERZO
+# =========================
+
+async def cmd_inicio_almuerzo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_group(update):
+        await send_message(update, context, "Usa /inicio_almuerzo dentro de un grupo.")
+        return
+
+    # 👇 AQUI
+    if not _gs_ready():
+        await send_message(update, context, "⚠️ Google Sheets no está configurado para registrar almuerzos.")
+        return
+
+    almuerzo = almuerzo_abierto(update.effective_user.id)
+
+    if almuerzo:
+        await send_message(update, context, "⚠️ Ya tienes un almuerzo en curso.")
+        return
+
+    await send_message(
+        update,
+        context,
+        "¿Seguro iniciar almuerzo?",
+        reply_markup=ALMUERZO_CONFIRM_KB,
+    )
+
+async def cmd_fin_almuerzo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_group(update):
+        await send_message(update, context, "Usa /fin_almuerzo dentro de un grupo.")
+        return
+
+    # 👇 AQUI
+    if not _gs_ready():
+        await send_message(update, context, "⚠️ Google Sheets no está configurado para consultar almuerzos.")
+        return
+
+    almuerzo = almuerzo_abierto(update.effective_user.id)
+
+    if not almuerzo:
+        await send_message(update, context, "⚠️ No hay un almuerzo en curso.")
+        return
+
+    kb = kb_inline(
+        [
+            ("SI", "ALM_FIN_SI"),
+            ("NO", "ALM_FIN_NO"),
+        ],
+        cols=2,
+    )
+
+    await send_message(
+        update,
+        context,
+        "¿Seguro cerrar almuerzo?",
+        reply_markup=kb,
+    )
+
+async def on_almuerzo_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ALM_INICIO_NO":
+        await safe_edit_or_send(query, "❌ Inicio de almuerzo cancelado.", reply_markup=None)
+        return
+
+    if query.data == "ALM_INICIO_SI":
+        try:
+            if almuerzo_abierto(query.from_user.id):
+                await safe_edit_or_send(query, "⚠️ Ya tienes un almuerzo en curso.", reply_markup=None)
+                return
+
+            now = now_peru_str()
+            hora = now[11:16]
+
+            registrar_inicio_almuerzo(
+                user_id=query.from_user.id,
+                chat_id=query.message.chat_id,
+                supervisor=query.from_user.full_name,
+            )
+
+            await safe_edit_or_send(
+                query,
+                f"🍽️ Inicio de almuerzo\n🕒 Hora de inicio: {hora}\n\nPara finalizar usa /fin_almuerzo",
+                reply_markup=None,
+            )
+        except Exception as e:
+            logging.exception("Error iniciando almuerzo")
+            await safe_edit_or_send(query, f"❌ No pude registrar el inicio de almuerzo.\nDetalle: {e}", reply_markup=None)
+
+async def on_almuerzo_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ALM_FIN_NO":
+        await safe_edit_or_send(query, "✅ Almuerzo sigue en curso.", reply_markup=None)
+        return
+
+    if query.data == "ALM_FIN_SI":
+        try:
+            if not almuerzo_abierto(query.from_user.id):
+                await safe_edit_or_send(query, "⚠️ No hay un almuerzo en curso.", reply_markup=None)
+                return
+
+            inicio, duracion_txt = cerrar_almuerzo(query.from_user.id)
+
+            now = now_peru_str()
+            hora_fin = now[11:16]
+
+            await safe_edit_or_send(
+                query,
+                f"🍽️ Fin de almuerzo\n"
+                f"🕒 Hora de inicio: {inicio}\n"
+                f"🕒 Hora de fin: {hora_fin}\n"
+                f"⏱️ Tiempo total: {duracion_txt}",
+                reply_markup=None,
+            )
+        except Exception as e:
+            logging.exception("Error cerrando almuerzo")
+            await safe_edit_or_send(query, f"❌ No pude cerrar el almuerzo.\nDetalle: {e}", reply_markup=None)
+
+# =========================
 # main()
 # =========================
 def main():
@@ -3433,6 +3652,8 @@ def main():
     app.add_handler(CommandHandler("cancelar_plantilla", cmd_cancelar_plantilla))
     app.add_handler(CommandHandler("reload_sheet", cmd_reload_sheet))
     app.add_handler(CommandHandler("cierre_hoy", cmd_cierre_hoy))
+    app.add_handler(CommandHandler("inicio_almuerzo", cmd_inicio_almuerzo))
+    app.add_handler(CommandHandler("fin_almuerzo", cmd_fin_almuerzo))
 
     cfg_conv = ConversationHandler(
         entry_points=[CommandHandler("config", cmd_config), CommandHandler("config_origin", cmd_config_origin)],
@@ -3451,6 +3672,8 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(cfg_conv, group=0)
+    app.add_handler(CallbackQueryHandler(on_almuerzo_confirm, pattern=r"^ALM_INICIO_"), group=0)
+    app.add_handler(CallbackQueryHandler(on_almuerzo_fin, pattern=r"^ALM_FIN_"), group=0)
 
     media_filter = (
         filters.PHOTO
