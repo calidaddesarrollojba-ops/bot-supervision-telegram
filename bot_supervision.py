@@ -510,7 +510,11 @@ def gs_append_dict(tab_name: str, data: Dict[str, Any]) -> None:
             val = ""
         row.append(str(val))
 
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    ws.append_row(
+    row,
+    value_input_option="USER_ENTERED",
+    insert_data_option="INSERT_ROWS",
+)
 
 def gs_get_all_records(tab_name: str) -> List[Dict[str, Any]]:
     ws = gs_ws(tab_name)
@@ -577,7 +581,7 @@ def almuerzo_abierto(user_id: int):
 
     for r in reversed(recs):
         if str(r.get("Supervisor_ID", "")).strip() == str(user_id):
-            if str(r.get("Hora_Fin", "")).strip() == "":
+            if str(r.get("Estado", "")).strip().upper() == "EN_CURSO":
                 return r
 
     return None
