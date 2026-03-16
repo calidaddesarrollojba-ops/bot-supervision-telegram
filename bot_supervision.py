@@ -511,10 +511,10 @@ def gs_append_dict(tab_name: str, data: Dict[str, Any]) -> None:
         row.append(str(val))
 
     ws.append_row(
-    row,
-    value_input_option="USER_ENTERED",
-    insert_data_option="INSERT_ROWS",
-)
+        row,
+        value_input_option="RAW",
+        insert_data_option="INSERT_ROWS",
+    )
 
 def gs_get_all_records(tab_name: str) -> List[Dict[str, Any]]:
     ws = gs_ws(tab_name)
@@ -587,55 +587,66 @@ def almuerzo_abierto(user_id: int):
     return None
 
 def registrar_inicio_almuerzo(user_id: int, chat_id: int, supervisor: str):
+    now_txt = now_peru_str()
+
     row = {
+        "ID_Almuerzo": str(uuid.uuid4()),
         "Fecha": date_peru_ymd(),
         "Supervisor": supervisor,
         "Supervisor_ID": str(user_id),
         "Chat_ID": str(chat_id),
-        "Hora_Inicio": now_peru_str(),
+        "Hora_Inicio": now_txt,
         "Hora_Fin": "",
-        "Duracion": "",
+        "Duracion_Minutos": "",
+        "Duracion_Texto": "",
         "Estado": "EN_CURSO",
-        "Creado_En": now_peru_str(),
+        "Creado_En": now_txt,
+        "Cerrado_En": "",
     }
 
     gs_append_dict(SHEET_TAB_ALMUERZOS, row)
 
 def cerrar_almuerzo(user_id: int):
-    recs = gs_get_all_records(SHEET_TAB_ALMUERZOS)
+    abierto = almuerzo_abierto(user_id)
+    if not abierto:
+        return "", "N/D"
 
-    for r in reversed(recs):
-        if str(r.get("Supervisor_ID", "")).strip() == str(user_id):
-            if str(r.get("Hora_Fin", "")).strip() == "":
-                inicio = r.get("Hora_Inicio", "")
+    almuerzo_id = str(abierto.get("ID_Almuerzo", "")).strip()
+    inicio = str(abierto.get("Hora_Inicio", "")).strip()
+    fin = now_peru_str()
 
-                fin = now_peru_str()
+    duracion_txt = format_duration_between(inicio, fin)
 
-                duracion = format_duration_between(inicio, fin)
+    duracion_min = ""
+    try:
+        dt_ini = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S").replace(tzinfo=PERU_TZ)
+        dt_fin = datetime.strptime(fin, "%Y-%m-%d %H:%M:%S").replace(tzinfo=PERU_TZ)
+        duracion_min = str(max(0, int((dt_fin - dt_ini).total_seconds() // 60)))
+    except Exception:
+        duracion_min = ""
 
-                row_idx = gs_find_row_index_first(
-                    SHEET_TAB_ALMUERZOS,
-                    {
-                        "Supervisor_ID": str(user_id),
-                        "Hora_Inicio": inicio,
-                    },
-                )
+    row_idx = None
+    if almuerzo_id:
+        row_idx = gs_find_row_index_first(
+            SHEET_TAB_ALMUERZOS,
+            {"ID_Almuerzo": almuerzo_id},
+        )
 
-                if row_idx:
-                    gs_update_row_by_headers(
-                        SHEET_TAB_ALMUERZOS,
-                        row_idx,
-                        {
-                            "Hora_Fin": fin,
-                            "Duracion": duracion,
-                            "Estado": "FINALIZADO",
-                        },
-                    )
+    if row_idx:
+        gs_update_row_by_headers(
+            SHEET_TAB_ALMUERZOS,
+            row_idx,
+            {
+                "Hora_Fin": fin,
+                "Duracion_Minutos": duracion_min,
+                "Duracion_Texto": duracion_txt,
+                "Estado": "FINALIZADO",
+                "Cerrado_En": fin,
+            },
+        )
 
-                hora_inicio = inicio[11:16] if inicio else ""
-                return hora_inicio, duracion
-
-    return "", "N/D"
+    hora_inicio = inicio[11:16] if len(inicio) >= 16 else inicio
+    return hora_inicio, duracion_txt
 
 # =========================
 # Plantillas: template + parse
